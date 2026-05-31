@@ -1,0 +1,68 @@
+version: "3.9"
+
+# SenteFlow AI - Full Stack (Evolution API Edition)
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - EVOLUTION_BASE_URL=http://evolution:8080
+      - EVOLUTION_API_KEY=${EVOLUTION_API_KEY:-changeme}
+      - EVOLUTION_SESSION=${EVOLUTION_SESSION:-senteflow}
+      - DEFAULT_ORG_ID=${DEFAULT_ORG_ID:-demo-org}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/firebase-service-account.json
+      - ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173,http://frontend:5173
+      - PORT=8000
+    volumes:
+      - ./backend/firebase-service-account.json:/app/firebase-service-account.json:ro
+      - senteflow_storage:/app/storage
+    depends_on:
+      - evolution
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  evolution:
+    image: atendai/evolution-api:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - AUTHENTICATION_API_KEY=${EVOLUTION_API_KEY:-changeme}
+      - DATABASE_ENABLED=false
+      - STORE_MESSAGES=false
+      - STORE_MESSAGE_UP=false
+      - STORE_CONTACTS=false
+      - WEBHOOK_GLOBAL_URL=http://backend:8000/api/webhooks/whatsapp
+      - WEBHOOK_GLOBAL_ENABLED=true
+      - WEBHOOK_EVENTS_MESSAGES_UPSERT=true
+      - WEBHOOK_EVENTS_CONNECTION_UPDATE=false
+      - WEBHOOK_EVENTS_QRCODE_UPDATED=false
+    volumes:
+      - evolution_instances:/evolution/instances
+    restart: unless-stopped
+
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    ports:
+      - "5173:5173"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: sh -c "npm install && npm start"
+    depends_on:
+      - backend
+
+volumes:
+  senteflow_storage:
+  evolution_instances:

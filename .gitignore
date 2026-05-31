@@ -1,0 +1,24 @@
+# Environment variables (contains API keys)
+.env
+.env.local
+.env.example
+
+# Firebase service account (contains private key)
+backend/firebase-service-account.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Node
+frontend/node_modules/
+frontend/build/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
