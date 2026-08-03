@@ -1,7 +1,7 @@
 """Tests for CustomerProfile domain model."""
 
 import pytest
-from domain.customer_profile import CustomerProfile, PaymentBehavior, LoyaltyTier
+from domain.customers.profile import CustomerProfile, PaymentBehavior, LoyaltyTier
 
 
 def make_profile(**kwargs):

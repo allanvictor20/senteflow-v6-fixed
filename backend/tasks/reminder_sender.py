@@ -41,11 +41,13 @@ Option C — FastAPI startup background loop (lightweight):
 import asyncio
 import logging
 from datetime import datetime, timedelta
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from integrations.whatsapp.client import EvolutionClient
     from repositories.transaction_repository import TransactionRepository
+from utils.clock import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +88,7 @@ async def send_overdue_reminders(
     Returns the number of reminders sent.
     """
     sent = 0
-    threshold_dt = datetime.utcnow() - timedelta(hours=overdue_hours)
+    threshold_dt = utc_now() - timedelta(hours=overdue_hours)
 
     try:
         docs = (
@@ -151,7 +153,7 @@ async def send_overdue_reminders(
         try:
             doc.reference.update({
                 "status": "notified",
-                "notified_at": datetime.utcnow().isoformat(),
+                "notified_at": utc_now().isoformat(),
             })
         except Exception as exc:
             logger.warning("reminder_mark_failed", extra={"doc_id": doc.id, "error": str(exc)})

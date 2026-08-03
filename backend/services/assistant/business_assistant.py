@@ -9,8 +9,10 @@ with Gemini only needed later for more open-ended wording.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+
+
 from typing import Any
+from utils.clock import utc_now
 
 
 @dataclass
@@ -85,7 +87,7 @@ class BusinessAssistant:
         return AssistantAnswer("pending_deliveries", answer, {"orders": orders})
 
     async def _sales_today(self) -> AssistantAnswer:
-        today = datetime.utcnow().date().isoformat()
+        today = utc_now().date().isoformat()
         transactions = await self.repo.list_transactions(self.org_id, limit=300)
         todays_sales = [
             t for t in transactions

@@ -5,10 +5,12 @@ Firestore persistence for BusinessTasks.
 """
 
 import logging
-from datetime import datetime
+
+
 from typing import Optional
 
 from domain.debts.task import BusinessTask, TaskStatus
+from utils.clock import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +29,7 @@ class TaskRepository:
 
     def save(self, org_id: str, task: BusinessTask) -> str:
         task.org_id = org_id
-        task.updated_at = datetime.utcnow().isoformat()
+        task.updated_at = utc_now().isoformat()
         self._col(org_id).document(task.id).set(task.model_dump(mode="json"), merge=True)
         logger.debug("task_saved", extra={"task_id": task.id, "title": task.title})
         return task.id
@@ -67,13 +69,13 @@ class TaskRepository:
     def complete_task(self, org_id: str, task_id: str, by: str = "system") -> None:
         self._col(org_id).document(task_id).update({
             "status": TaskStatus.COMPLETED.value,
-            "completed_at": datetime.utcnow().isoformat(),
+            "completed_at": utc_now().isoformat(),
             "completed_by": by,
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": utc_now().isoformat(),
         })
 
     def list_overdue(self, org_id: str) -> list[BusinessTask]:
-        now = datetime.utcnow().isoformat()
+        now = utc_now().isoformat()
         docs = (
             self._col(org_id)
             .where("status", "==", TaskStatus.PENDING.value)

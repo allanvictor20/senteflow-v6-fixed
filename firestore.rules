@@ -64,15 +64,65 @@ service cloud.firestore {
       }
 
       // ── Conversations ─────────────────────────────────────────────────────
+      // NOTE: the backend stores the conversation timeline as an ARRAY FIELD on
+      // this document (via ArrayUnion), not as a subcollection. The append-only
+      // guarantee therefore has to be expressed here — a rule on a
+      // /timeline/{entryId} subcollection would never be evaluated, because no
+      // such subcollection is ever written.
       match /conversations/{conversationId} {
         allow read: if isMember(orgId);
-        allow write: if isMember(orgId);
+        allow create: if isMember(orgId);
+        allow update: if isMember(orgId)
+          // Entries may only be appended: the new timeline must start with the
+          // existing one, so nothing already recorded can be edited or removed.
+          && (
+            !('timeline' in resource.data)
+            || !('timeline' in request.resource.data)
+            || request.resource.data.timeline.size() >= resource.data.timeline.size()
+          );
+        allow delete: if false;
+      }
 
-        match /timeline/{entryId} {
-          allow read: if isMember(orgId);
-          allow create: if isMember(orgId);
-          allow update, delete: if false;  // Timeline is append-only
-        }
+      // ── Conversation Aggregates (state machine snapshots) ─────────────────
+      match /conversation_aggregates/{aggregateId} {
+        allow read: if isMember(orgId);
+        allow write: if isMember(orgId);
+        allow delete: if false;
+      }
+
+      // ── Customer Profiles (rich CustomerProfile model) ────────────────────
+      match /customer_profiles/{profileId} {
+        allow read: if isMember(orgId);
+        allow write: if isMember(orgId);
+        allow delete: if false;
+      }
+
+      // ── Media Assets (receipts, voice notes) ──────────────────────────────
+      match /media_assets/{assetId} {
+        allow read: if isMember(orgId);
+        allow write: if isMember(orgId);
+        allow delete: if false;
+      }
+
+      // ── Entity Links (why two records belong together) ────────────────────
+      match /entity_links/{linkId} {
+        allow read: if isMember(orgId);
+        allow create: if isMember(orgId);
+        allow update, delete: if false;   // Links are immutable evidence
+      }
+
+      // ── Tasks ─────────────────────────────────────────────────────────────
+      match /tasks/{taskId} {
+        allow read: if isMember(orgId);
+        allow write: if isMember(orgId);
+        allow delete: if false;
+      }
+
+      // ── Webhook Queue (server-only) ───────────────────────────────────────
+      // Written exclusively by the Admin SDK, which bypasses these rules.
+      // Denying all client access keeps raw provider payloads out of reach.
+      match /webhook_queue/{queueId} {
+        allow read, write: if false;
       }
 
       // ── Customer Memory ───────────────────────────────────────────────────

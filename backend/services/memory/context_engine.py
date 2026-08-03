@@ -65,6 +65,7 @@ class ContextEngine:
             "open_orders",
             "recent_events",
             "unresolved_promises",
+            "entity_links",
             "insights",
         ]
 
@@ -74,12 +75,13 @@ class ContextEngine:
             self._get_open_orders(sender_id),
             self._recent_events(sender_id),
             self._unresolved_promises(sender_id),
+            self._get_entity_links(sender_id),
             self._get_insights(sender_id),
             return_exceptions=True,
         )
 
         context: dict[str, Any] = {}
-        defaults = [{}, {}, [], [], [], {"proactive_insights": [], "payment_pattern": {}}]
+        defaults = [{}, {}, [], [], [], [], {"proactive_insights": [], "payment_pattern": {}}]
 
         for key, result, default in zip(keys, results, defaults):
             if isinstance(result, Exception):
@@ -228,6 +230,23 @@ class ContextEngine:
                 )
             ][:10]
         except Exception:
+            return []
+
+    async def _get_entity_links(self, sender_id: str, limit: int = 25) -> list[dict]:
+        """
+        Relationships already recorded for this customer — which receipts,
+        orders and transactions the system believes belong together. Lets the
+        model reason about "the payment for that order" without re-deriving it.
+        """
+        finder = getattr(self.repo, "find_entity_links", None)
+        if finder is None:
+            return []
+        try:
+            return await _maybe_await(
+                finder(self.org_id, "customer", sender_id, limit=limit)
+            ) or []
+        except Exception as exc:
+            logger.warning("entity_links_fetch_failed", extra={"error": str(exc)})
             return []
 
     async def _get_insights(self, sender_id: str) -> dict:

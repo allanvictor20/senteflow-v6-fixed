@@ -5,10 +5,12 @@ Firestore persistence for the rich CustomerProfile model.
 """
 
 import logging
-from datetime import datetime
+
+
 from typing import Optional
 
 from domain.customers.profile import CustomerProfile
+from utils.clock import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +29,7 @@ class CustomerProfileRepository:
 
     def upsert(self, org_id: str, profile: CustomerProfile) -> str:
         profile.org_id = org_id
-        profile.updated_at = datetime.utcnow().isoformat()
+        profile.updated_at = utc_now().isoformat()
         doc_ref = self._col(org_id).document(profile.id)
         doc_ref.set(profile.model_dump(mode="json"), merge=True)
         logger.debug("customer_profile_upserted", extra={"id": profile.id})
@@ -87,6 +89,6 @@ class CustomerProfileRepository:
     def update_ai_summary(self, org_id: str, profile_id: str, summary: str) -> None:
         self._col(org_id).document(profile_id).update({
             "ai_summary": summary,
-            "ai_summary_generated_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat(),
+            "ai_summary_generated_at": utc_now().isoformat(),
+            "updated_at": utc_now().isoformat(),
         })

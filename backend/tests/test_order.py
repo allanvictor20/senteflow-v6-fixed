@@ -1,7 +1,7 @@
 """Tests for Order domain model."""
 
 import pytest
-from domain.order import Order, OrderItem, OrderStatus, PaymentStatus
+from domain.orders.model import Order, OrderItem, OrderStatus, PaymentStatus
 
 
 def make_order(**kwargs):

@@ -10,6 +10,7 @@ beyond simple debits and credits.
 
 import uuid
 from datetime import datetime
+
 from enum import Enum
 from typing import Any, Optional
 
@@ -20,6 +21,7 @@ from domain.events.event_types import (
     FINANCIAL_EVENTS,
     FOLLOWUP_REQUIRED_EVENTS,
 )
+from utils.clock import utc_now
 
 
 class ProcessingStatus(str, Enum):
@@ -46,7 +48,7 @@ class BusinessEvent(BaseModel):
     source_type: str = "whatsapp"   # whatsapp | api | upload
     sender_id: str = ""
     business_id: str = ""
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
 
     # Extracted meaning
     entities: dict[str, Any] = Field(default_factory=dict)
@@ -96,6 +98,17 @@ class BusinessEvent(BaseModel):
         entities_str = ", ".join(f"{k}={v}" for k, v in list(self.entities.items())[:3])
         return f"[{etype}] {entities_str} (confidence {conf_pct}%)"
 
+    def to_storable(self) -> dict[str, Any]:
+        """
+        JSON-safe payload for persistence.
+
+        `context` is deliberately excluded: it is request-scoped enrichment that
+        can hold live objects (repositories, HTTP clients) which are not
+        serializable, and re-storing it on every event would duplicate data that
+        already lives in its own collections.
+        """
+        return self.model_dump(mode="json", exclude={"context"})
+
 
 class EventResult(BaseModel):
     """
@@ -109,4 +122,6 @@ class EventResult(BaseModel):
     whatsapp_reply: str = ""
     transaction_ids: list[str] = Field(default_factory=list)
     followup_scheduled: bool = False
+    pending_approval: bool = False
+    """True when a HIGH-RISK action was held back awaiting owner confirmation."""
     error: Optional[str] = None

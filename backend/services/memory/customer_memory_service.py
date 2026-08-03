@@ -13,12 +13,14 @@ Responsibilities:
 
 import logging
 from datetime import datetime, timedelta
+
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from repositories.customer_profile_repository import CustomerProfileRepository
 
 from domain.customers.profile import CustomerProfile
+from utils.clock import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +71,7 @@ class CustomerMemoryService:
                 last = datetime.fromisoformat(
                     profile.ai_summary_generated_at.replace("Z", "+00:00")
                 )
-                if datetime.utcnow() - last.replace(tzinfo=None) < timedelta(hours=_SUMMARY_REFRESH_HOURS):
+                if utc_now() - last.replace(tzinfo=None) < timedelta(hours=_SUMMARY_REFRESH_HOURS):
                     return profile.ai_summary
             except Exception:
                 pass

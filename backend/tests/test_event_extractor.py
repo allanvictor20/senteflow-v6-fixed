@@ -1,6 +1,6 @@
 """
 Tests for EventExtractor — amount parsing, entity coercion, extraction pipeline.
-No API key needed: _call_gemini is mocked throughout.
+No API key needed: _call_llm is mocked throughout.
 """
 import pytest
 from unittest.mock import AsyncMock, patch
@@ -58,7 +58,7 @@ VALID_RESPONSE = {
 
 @pytest.mark.asyncio
 async def test_extract_event_happy_path():
-    with patch("services.ai.event_extractor._call_gemini", new=AsyncMock(return_value=VALID_RESPONSE)):
+    with patch("services.llm.event_extractor._call_llm", new=AsyncMock(return_value=VALID_RESPONSE)):
         event = await extract_event("Sarah paid 50k", "256700000001@c.us", "org-1")
     assert event.event_type == EventType.PAYMENT_RECEIVED
     assert event.confidence == 0.95
@@ -68,7 +68,7 @@ async def test_extract_event_happy_path():
 @pytest.mark.asyncio
 async def test_unknown_event_type_fallback():
     bad = {**VALID_RESPONSE, "event_type": "invented_type"}
-    with patch("services.ai.event_extractor._call_gemini", new=AsyncMock(return_value=bad)):
+    with patch("services.llm.event_extractor._call_llm", new=AsyncMock(return_value=bad)):
         event = await extract_event("some msg", "s-1", "org-1")
     assert event.event_type == EventType.UNKNOWN
 
@@ -76,14 +76,14 @@ async def test_unknown_event_type_fallback():
 @pytest.mark.asyncio
 async def test_confidence_clamped():
     over = {**VALID_RESPONSE, "confidence": 1.8}
-    with patch("services.ai.event_extractor._call_gemini", new=AsyncMock(return_value=over)):
+    with patch("services.llm.event_extractor._call_llm", new=AsyncMock(return_value=over)):
         event = await extract_event("msg", "s-1", "org-1")
     assert event.confidence <= 1.0
 
 
 @pytest.mark.asyncio
-async def test_gemini_failure_returns_unknown():
-    with patch("services.ai.event_extractor._call_gemini", new=AsyncMock(side_effect=Exception("timeout"))):
+async def test_llm_failure_returns_unknown():
+    with patch("services.llm.event_extractor._call_llm", new=AsyncMock(side_effect=Exception("timeout"))):
         event = await extract_event("Sarah paid 50k", "s-1", "org-1")
     assert event.event_type == EventType.UNKNOWN
     assert event.confidence == 0.0

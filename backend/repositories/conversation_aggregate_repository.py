@@ -5,10 +5,12 @@ Firestore persistence for the full ConversationAggregate state machine.
 """
 
 import logging
-from datetime import datetime
+
+
 from typing import Optional
 
 from domain.conversations.state import ConversationAggregate
+from utils.clock import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +29,7 @@ class ConversationAggregateRepository:
 
     def save(self, org_id: str, agg: ConversationAggregate) -> str:
         agg.org_id = org_id
-        agg.updated_at = datetime.utcnow().isoformat()
+        agg.updated_at = utc_now().isoformat()
         self._col(org_id).document(agg.conversation_id).set(
             agg.model_dump(mode="json"), merge=True
         )

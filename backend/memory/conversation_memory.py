@@ -1,7 +1,9 @@
 """Simple recent-interaction memory for WhatsApp conversations."""
 
-from datetime import datetime
+
+
 from typing import Any
+from utils.clock import utc_now
 
 
 class ConversationMemory:
@@ -24,7 +26,7 @@ class ConversationMemory:
             sender_id,
             {
                 "event_id": event_id,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": utc_now().isoformat(),
                 "message": text,
                 "intent": intent,
                 "extracted": extracted or {},

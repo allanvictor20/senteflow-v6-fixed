@@ -1,7 +1,13 @@
 """
-SenteFlow — Dependency Injection (v5)
+SenteFlow — Dependency Injection (v6)
 =======================================
 Wires all repositories, services, and the WhatsApp client.
+
+`repo` is the TransactionRepository facade. That choice matters: the message
+router, action dispatcher, context engine, reminder sender and legacy API
+routes all call the facade's wide surface (list_transactions, save_media_asset,
+enqueue_webhook_event, ...). The per-aggregate repositories are exposed
+separately for the routers that were written against them.
 
 v5 additions:
 - MemoryRepository injected for IDEA 03 (CustomerMemory fast path in ContextEngine)
@@ -9,7 +15,7 @@ v5 additions:
 - OrgConfig loaded for IDEA 09 (permission system)
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 import os
 
@@ -17,14 +23,22 @@ import os
 @dataclass
 class AppDependencies:
     db: object
-    repo: object                        # ConversationAggregateRepository
+    repo: object                        # TransactionRepository (shared facade)
     wa_client: Optional[object] = None  # EvolutionClient
     org_id: str = "default"
     mem_repo: Optional[object] = None   # MemoryRepository (IDEA 03)
     profile_repo: Optional[object] = None  # BusinessProfileRepository (IDEA 08)
     org_config: Optional[object] = None    # OrgConfig (IDEA 09)
 
-    _message_router: object = None
+    # Per-aggregate repositories used by the /api routers
+    conv_agg_repo: Optional[object] = None
+    order_repo: Optional[object] = None
+    task_repo: Optional[object] = None
+    customer_profile_repo: Optional[object] = None
+    customer_memory_svc: Optional[object] = None
+    order_svc: Optional[object] = None
+
+    _message_router: object = field(default=None, repr=False)
 
     def message_router(self):
         if self._message_router is None:
@@ -45,14 +59,26 @@ def build_dependencies(db, org_id: str = "default") -> AppDependencies:
     Construct all dependencies from a Firestore db client.
     Called once at application startup.
     """
+    from repositories.transaction_repository import TransactionRepository
     from repositories.conversation_aggregate_repository import ConversationAggregateRepository
+    from repositories.customer_profile_repository import CustomerProfileRepository
     from repositories.memory_repository import MemoryRepository
     from repositories.business_profile_repository import BusinessProfileRepository
+    from repositories.order_repository import OrderRepository
+    from repositories.task_repository import TaskRepository
+    from services.memory.customer_memory_service import CustomerMemoryService
+    from services.orders.order_service import OrderService
     from domain.permissions.model import OrgConfig
 
-    repo = ConversationAggregateRepository(db)
+    repo = TransactionRepository(db)
+    conv_agg_repo = ConversationAggregateRepository(db)
     mem_repo = MemoryRepository(db)
     profile_repo = BusinessProfileRepository(db)
+    order_repo = OrderRepository(db)
+    task_repo = TaskRepository(db)
+    customer_profile_repo = CustomerProfileRepository(db)
+    customer_memory_svc = CustomerMemoryService(customer_profile_repo)
+    order_svc = OrderService(order_repo)
 
     # OrgConfig: load defaults; in future this can be loaded from Firestore per-org
     org_config = OrgConfig.default(org_id)
@@ -78,4 +104,10 @@ def build_dependencies(db, org_id: str = "default") -> AppDependencies:
         mem_repo=mem_repo,
         profile_repo=profile_repo,
         org_config=org_config,
+        conv_agg_repo=conv_agg_repo,
+        order_repo=order_repo,
+        task_repo=task_repo,
+        customer_profile_repo=customer_profile_repo,
+        customer_memory_svc=customer_memory_svc,
+        order_svc=order_svc,
     )

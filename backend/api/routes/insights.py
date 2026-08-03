@@ -14,7 +14,7 @@ Returns AI-generated business intelligence:
 import logging
 from fastapi import APIRouter, Depends, HTTPException
 
-from core.auth import verify_firebase_token, verify_org_access
+from core.auth import verify_firebase_token, ensure_org_access
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ async def get_insights(
     org_id: str,
     _token: dict = Depends(verify_firebase_token),
 ):
-    verify_org_access(_token, org_id)
+    ensure_org_access(_token, org_id)
 
     insights = []
 
@@ -123,7 +123,7 @@ async def get_business_pulse(
     """
     Business Pulse — homepage summary numbers.
     """
-    verify_org_access(_token, org_id)
+    ensure_org_access(_token, org_id)
 
     pulse = {
         "active_tasks": 0,

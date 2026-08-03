@@ -24,9 +24,11 @@ _build_reply covering all event types.
 """
 
 import logging
+
 import inspect
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable, TYPE_CHECKING, Optional
+from utils.clock import utc_now
 
 from domain.events.business_event import BusinessEvent, EventResult, ProcessingStatus
 from domain.events.event_types import EventType
@@ -67,7 +69,7 @@ def _resolve_due_date(raw_due: Any) -> str:
         return "soon"
     s = str(raw_due).strip().lower()
     if s == "tomorrow":
-        dt = datetime.utcnow() + timedelta(days=1)
+        dt = utc_now() + timedelta(days=1)
         return dt.strftime("%a %d %b")
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
         try:
@@ -75,7 +77,9 @@ def _resolve_due_date(raw_due: Any) -> str:
             return dt.strftime("%a %d %b")
         except ValueError:
             pass
-    return raw_due.strip().title()
+    # Title-case the normalised string, not raw_due — raw_due can be an int or
+    # date object, and .strip() on those raises.
+    return s.title()
 
 
 # ─── Base tool class (IDEA 01) ────────────────────────────────────────────────
@@ -211,7 +215,7 @@ class ScheduleReminderTool(ToolBase):
             "sender_id": event.sender_id,
             "raw_message": event.raw_message,
             "status": "pending",
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": utc_now().isoformat(),
             "org_id": org_id,
         }
 
@@ -430,7 +434,7 @@ class ActionDispatcher:
                 # Stop further actions — owner must confirm first
                 event.processing_status = ProcessingStatus.PENDING
                 await _maybe_await(
-                    self.repo.save_business_event(self.org_id, event.model_dump(mode="json"))
+                    self.repo.save_business_event(self.org_id, event.to_storable())
                 )
                 return result
 
@@ -465,7 +469,7 @@ class ActionDispatcher:
         )
 
         try:
-            await _maybe_await(self.repo.save_business_event(self.org_id, event.model_dump(mode="json")))
+            await _maybe_await(self.repo.save_business_event(self.org_id, event.to_storable()))
         except Exception as exc:
             logger.warning("business_event_persist_failed", extra={"error": str(exc)})
 

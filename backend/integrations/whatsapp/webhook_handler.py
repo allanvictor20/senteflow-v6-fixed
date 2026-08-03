@@ -6,13 +6,16 @@ messages into normalized MessageEvent objects.
 """
 
 import logging
+import os
 import uuid
 import hashlib
 import hmac
 from datetime import datetime
+
 from typing import Optional
 
 from core.message_event import MessageEvent, MessageType
+from utils.clock import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -43,14 +46,23 @@ def verify_webhook_signature(
     the 'x-webhook-signature' header as 'sha256=<hex>'.
 
     Returns True if:
-      - No webhook secret is configured (dev mode — skip verification)
       - The computed HMAC matches the provided signature
+      - No webhook secret is configured AND we are not in production
 
     Returns False (reject the request) if a secret is set but the
-    signature is missing or does not match.
+    signature is missing or does not match, or if no secret is configured
+    while ENVIRONMENT=production. Silently accepting unsigned webhooks in
+    production would let anyone post fabricated messages into the pipeline.
     """
     if not webhook_secret:
-        return True  # secret not configured — allow (dev mode)
+        environment = os.environ.get("ENVIRONMENT", "production").lower()
+        if environment in ("production", "prod"):
+            logger.error(
+                "webhook_secret_missing_in_production",
+                extra={"hint": "Set WEBHOOK_SECRET to accept Evolution API webhooks"},
+            )
+            return False
+        return True  # secret not configured — allow (dev mode only)
     if not signature_header:
         return False
     try:
@@ -102,7 +114,7 @@ def normalize_evolution_event(payload: dict) -> Optional[MessageEvent]:
         ) = _extract_message_content(message_type_raw, message_obj)
 
         ts_raw = data.get("messageTimestamp")
-        timestamp = datetime.utcfromtimestamp(int(ts_raw)) if ts_raw else datetime.utcnow()
+        timestamp = datetime.utcfromtimestamp(int(ts_raw)) if ts_raw else utc_now()
 
         event = MessageEvent(
             event_id=str(uuid.uuid4()),

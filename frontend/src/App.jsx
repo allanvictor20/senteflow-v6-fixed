@@ -12,7 +12,9 @@ import AskSenteFlow from "./features/ask/AskSenteFlow";
 import BusinessMemoryView from "./features/memory/BusinessMemoryView";
 import ReviewView from "./features/review/ReviewView";
 
-const ORG_ID = "demo-org";
+// Must match the backend's DEFAULT_ORG_ID. They were "demo-org" and "default"
+// respectively, so the dashboard read a different org than the bot wrote to.
+const ORG_ID = process.env.REACT_APP_ORG_ID || "default";
 
 function LoginPage({ onLogin, error }) {
   return (

@@ -21,8 +21,10 @@ Summary / help / greeting shortcuts are handled inside _handle_simple_commands
 so we don't need pre-routing for those.
 """
 
+import asyncio
 import logging
 import inspect
+import re
 from typing import TYPE_CHECKING
 
 from core.message_event import MessageEvent, MessageType
@@ -35,11 +37,31 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Fire-and-forget tasks must be strongly referenced, otherwise the event loop
+# is free to garbage-collect them mid-flight and the work silently vanishes.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro, name: str) -> None:
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
 
 async def _maybe_await(value):
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+def _mentions(text: str, terms: tuple[str, ...]) -> bool:
+    """
+    Whole-word containment test.
+
+    Substring matching would fire the greeting branch on "this"/"shipping"
+    (both contain "hi"), so every term is matched on word boundaries instead.
+    """
+    return any(re.search(rf"\b{re.escape(term)}\b", text) for term in terms)
 
 
 # ── Gap 5: Pending Clarification State ────────────────────────────────────────
@@ -124,6 +146,9 @@ class MessageRouter:
         self.org_config = org_config
         # Set by main.py after all bounded contexts are initialised
         self.event_pipeline = None
+        # One manager per router, not per message: its in-memory fallback cache
+        # is useless if a fresh instance is constructed on every turn.
+        self.pending_mgr = PendingStateManager(repo, org_id)
 
     async def route(self, event: MessageEvent) -> None:
         logger.info(
@@ -164,7 +189,7 @@ class MessageRouter:
         if not event.text:
             return
 
-        pending_mgr = PendingStateManager(self.repo, self.org_id)
+        pending_mgr = self.pending_mgr
 
         # Gap 5 — check if bot is waiting for an answer to a clarification question
         pending = await pending_mgr.get_pending_state(event.sender_id)
@@ -201,8 +226,10 @@ class MessageRouter:
         Gap 5: Clarification replies set pending state in Firestore.
         """
         from services.memory.context_engine import ContextEngine
-        from services.llm.event_extractor import extract_event as EventInterpreter
-        # Acknowledge media up front so the user knows we got it
+
+        # Media goes straight to the file extraction pipeline. Asking the text
+        # classifier to interpret an empty string first would cost an LLM call
+        # and could never return anything useful.
         if event.is_media:
             media_label = {
                 MessageType.IMAGE: "📸 image",
@@ -211,6 +238,8 @@ class MessageRouter:
                 MessageType.DOCUMENT: "📄 document",
             }.get(event.message_type, "file")
             await self._reply(event, f"Got your {media_label}, {event.display_sender}! Processing...")
+            await self._process_media_extraction(event, source_hint=event.message_type.value)
+            return
 
         try:
             # ── Gap 3: Build context for EVERY message before any AI call ────
@@ -239,11 +268,21 @@ class MessageRouter:
             except Exception as exc:
                 logger.warning("memory_inject_failed", extra={"error": str(exc)})
                 context["recent_memory"] = "No prior interactions."
-            context["wa_client"] = self.wa_client
+
+            # NOTE: the WhatsApp client is deliberately NOT put into `context`.
+            # `context` ends up on BusinessEvent and gets serialised to
+            # Firestore; a live HTTP client in there makes the event
+            # unserialisable. Anything needing the client takes it as an argument.
 
             # ── Interpret → BusinessEvent ─────────────────────────────────────
-            interpreter = EventInterpreter(business_id=self.org_id)
-            business_event = await interpreter.interpret(event, context)
+            # extract_event is a coroutine function, not a class — call it directly.
+            business_event = await extract_event(
+                raw_message=event.text or "",
+                sender_id=event.sender_id,
+                business_id=self.org_id,
+                context=context,
+                profile_repo=self.profile_repo,
+            )
 
             logger.info(
                 "event_classified",
@@ -253,11 +292,6 @@ class MessageRouter:
                     "sender": event.sender_id,
                 },
             )
-
-            # ── Media: fall through to legacy extraction ──────────────────────
-            if business_event.recommended_actions == ["run_extraction_workflow"]:
-                await self._process_media_extraction(event, source_hint=event.message_type.value)
-                return
 
             # ── Handle simple commands that don't need ActionDispatcher ───────
             command_handled = await self._handle_simple_commands(event, business_event, context)
@@ -294,7 +328,7 @@ class MessageRouter:
                 raw_reply = f"Recorded. {business_event.to_summary()}"
 
             if is_clarification:
-                await PendingStateManager(self.repo, self.org_id).set_pending_clarification(
+                await self.pending_mgr.set_pending_clarification(
                     sender_id=event.sender_id,
                     original_text=event.text or "",
                     clarification_question=raw_reply,
@@ -315,10 +349,10 @@ class MessageRouter:
             # FIX (v2): Piggyback reminder check on every real message — no scheduler needed.
             # Fires overdue reminders when the business owner is actively texting the bot.
             # Runs as a non-blocking task so it never delays the current reply.
-            import asyncio as _asyncio
             from tasks.reminder_sender import send_overdue_reminders as _send_reminders
-            _asyncio.create_task(
-                _send_reminders(self.wa_client, self.repo, self.org_id)
+            _spawn(
+                _send_reminders(self.wa_client, self.repo, self.org_id),
+                name=f"overdue_reminders:{self.org_id}",
             )
 
         except Exception as exc:
@@ -335,7 +369,7 @@ class MessageRouter:
         if business_event.event_type == EventType.UNKNOWN and event.text:
             lowered = event.text.lower().strip()
 
-            if any(term in lowered for term in ("hello", "hi", "hey", "good morning", "good afternoon")):
+            if _mentions(lowered, ("hello", "hi", "hey", "good morning", "good afternoon")):
                 await self._reply(
                     event,
                     f"👋 Hello {event.display_sender}! I'm SenteFlow AI.\n\n"
@@ -348,19 +382,19 @@ class MessageRouter:
                 )
                 return True
 
-            if any(term in lowered for term in ("summary", "summarize")):
+            if _mentions(lowered, ("summary", "summarize", "summarise")):
                 await self._send_summary(event)
                 return True
 
-            if any(term in lowered for term in ("recent", "last transactions")):
+            if _mentions(lowered, ("recent",)) or "last transactions" in lowered:
                 await self._send_recent_transactions(event)
                 return True
 
-            if "debt" in lowered or "who owes" in lowered:
+            if _mentions(lowered, ("debt", "debts", "owes", "owe")):
                 await self._send_debt_info(event, event.text)
                 return True
 
-            if any(term in lowered for term in ("help", "what can you do")):
+            if _mentions(lowered, ("help",)) or "what can you do" in lowered:
                 await self._reply(
                     event,
                     "💡 *SenteFlow AI Help*\n\n"
@@ -382,14 +416,19 @@ class MessageRouter:
     async def _process_media_extraction(self, event: MessageEvent, source_hint: str) -> None:
         from integrations.whatsapp.media_handler import save_whatsapp_media
         from services.llm.media_processor import MediaDownloadError
-        from workflows.event_extraction_workflow import run_event_extraction as run_extraction
+        from workflows.media_extraction_workflow import run_media_extraction
         from services.responses.reply_generator import generate_extraction_reply
-        from services.actions.action_dispatcher import ActionDispatcher as _AD
+
         async def record_transaction_batch(transactions, org_id, sender_id, session_id, repo):
             ids = []
             for txn in transactions:
-                event_id = repo.save_business_event(org_id, txn if isinstance(txn, dict) else txn.model_dump(mode="json"))
-                ids.append(event_id)
+                record = txn if isinstance(txn, dict) else txn.model_dump(mode="json")
+                record.setdefault("event_type", "expense_recorded")
+                record["sender_id"] = sender_id
+                record["recorded_by"] = sender_id
+                record["upload_session_id"] = session_id
+                record["source"] = "whatsapp"
+                ids.append(await _maybe_await(repo.save_business_event(org_id, record)))
             return ids
 
         if not event.media_url:
@@ -415,7 +454,7 @@ class MessageRouter:
             await self._reply(event, "⚠️ Couldn't save the media locally. Please try again.")
             return
 
-        media_id = self.repo.save_media_asset(self.org_id, {
+        media_id = await _maybe_await(self.repo.save_media_asset(self.org_id, {
             "media_id": event.message_id,
             "sender_id": event.sender_id,
             "chat_id": event.chat_id,
@@ -427,28 +466,31 @@ class MessageRouter:
             "source_hint": source_hint,
             "extraction_status": "processing",
             "metadata": {"timestamp": event.timestamp.isoformat(), "caption": event.text},
-        })
+        }))
 
         try:
             filename = event.media_filename or f"{source_hint}_{event.event_id}"
-            import asyncio as _asyncio
-            result, session_id = await _asyncio.to_thread(run_extraction, file_path, filename)
+            # run_media_extraction is synchronous and CPU/network bound —
+            # to_thread keeps it off the event loop.
+            result, session_id = await asyncio.to_thread(
+                run_media_extraction, file_path, filename
+            )
         except Exception as exc:
             logger.error("extraction_failed", extra={"error": str(exc), "sender": event.sender_id})
-            self.repo.save_media_asset(self.org_id, {
+            await _maybe_await(self.repo.save_media_asset(self.org_id, {
                 "media_id": media_id,
                 "extraction_status": "failed",
                 "last_error": str(exc),
-            })
+            }))
             await self._reply(event, "❌ I had trouble processing that. Please try again or send a clearer image.")
             return
 
         if not result.transactions:
-            self.repo.save_media_asset(self.org_id, {
+            await _maybe_await(self.repo.save_media_asset(self.org_id, {
                 "media_id": media_id,
                 "extraction_status": "empty",
                 "extracted_entities": [],
-            })
+            }))
             await self._reply(
                 event,
                 f"I processed your {source_hint.replace('_', ' ')} but couldn't find any clear "
@@ -459,14 +501,14 @@ class MessageRouter:
         saved_ids = await record_transaction_batch(
             result.transactions, self.org_id, event.sender_id, session_id, self.repo
         )
-        self.repo.save_media_asset(self.org_id, {
+        await _maybe_await(self.repo.save_media_asset(self.org_id, {
             "media_id": media_id,
             "extraction_status": "completed",
             "related_transaction_ids": saved_ids,
             "extracted_entities": [txn.model_dump(mode="json") for txn in result.transactions],
             "summary": result.summary,
             "language": result.language_detected,
-        })
+        }))
 
         try:
             from services.conversation import ConversationStateManager, EntityLinker
@@ -497,10 +539,14 @@ class MessageRouter:
 
     # ── Report Helpers ────────────────────────────────────────────────────────
 
+    # The repository is synchronous. `_maybe_await` keeps these helpers working
+    # against either a sync repo or a future async one — awaiting the sync one
+    # directly raises TypeError and turns every report into an error reply.
+
     async def _send_summary(self, event: MessageEvent) -> None:
         from services.responses.reply_generator import generate_summary_reply
         try:
-            summary = await self.repo.compute_financial_summary(self.org_id)
+            summary = await _maybe_await(self.repo.compute_financial_summary(self.org_id))
             await self._reply(event, generate_summary_reply(summary))
         except Exception as exc:
             logger.error("summary_failed", extra={"error": str(exc)})
@@ -509,7 +555,7 @@ class MessageRouter:
     async def _send_recent_transactions(self, event: MessageEvent) -> None:
         from services.responses.reply_generator import generate_recent_reply
         try:
-            transactions = await self.repo.list_transactions(self.org_id, limit=10)
+            transactions = await _maybe_await(self.repo.list_transactions(self.org_id, limit=10))
             await self._reply(event, generate_recent_reply(transactions))
         except Exception as exc:
             logger.error("recent_transactions_failed", extra={"error": str(exc)})
@@ -517,10 +563,9 @@ class MessageRouter:
 
     async def _send_debt_info(self, event: MessageEvent, text: str) -> None:
         from services.responses.reply_generator import generate_debt_reply
-        words = text.lower().replace("debt", "").replace("owes", "").strip().split()
-        name_query = " ".join(words).strip() if words else None
+        name_query = _extract_debt_name_query(text)
         try:
-            transactions = await self.repo.list_transactions(self.org_id)
+            transactions = await _maybe_await(self.repo.list_transactions(self.org_id))
             await self._reply(event, generate_debt_reply(transactions, name_query))
         except Exception as exc:
             logger.error("debt_info_failed", extra={"error": str(exc)})
@@ -557,6 +602,25 @@ class MessageRouter:
 
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
+
+# Words that carry no signal when the owner asks about someone's balance.
+# Stripping only the command keyword left filler like "who" in the query, so
+# "who owes brian" searched for the customer "who brian" and always missed.
+_DEBT_QUERY_STOPWORDS = frozenset({
+    "debt", "debts", "owe", "owes", "owed", "owing", "who", "whos", "who's",
+    "what", "whats", "what's", "how", "much", "is", "are", "the", "my", "me",
+    "show", "list", "check", "tell", "does", "do", "for", "of", "on", "to",
+    "balance", "outstanding", "still", "and", "a", "an", "any",
+})
+
+
+def _extract_debt_name_query(text: str) -> str | None:
+    """Pull the customer name out of a free-form debt question."""
+    words = re.findall(r"[\w']+", (text or "").lower())
+    name_words = [w for w in words if w not in _DEBT_QUERY_STOPWORDS]
+    query = " ".join(name_words).strip()
+    return query or None
+
 
 def _format_memory_for_prompt(interactions: list[dict]) -> str:
     """Gap 4: Convert recent interactions into a prompt-friendly string."""

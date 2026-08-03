@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 from domain.events.business_event import BusinessEvent
 from domain.events.event_types import EventType
 from services.tasks.task_generation_service import TaskGenerationService
-from domain.task import TaskCategory, TaskPriority
+from domain.debts.task import TaskCategory, TaskPriority
 
 
 def make_event(event_type: str, entities: dict = None, sender_id: str = "cust-001") -> BusinessEvent:

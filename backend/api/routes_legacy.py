@@ -21,17 +21,16 @@ import tempfile
 import uuid
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from core.auth import verify_firebase_token, verify_org_access
-from fastapi import Depends
 from pydantic import BaseModel
 
+from core.auth import verify_firebase_token, verify_org_access
 from core.errors import SenteFlowError, StructuredLogger, success_response
-from workflows.event_extraction_workflow import run_event_extraction as run_extraction
+from workflows.media_extraction_workflow import run_media_extraction
 from repositories.transaction_repository import TransactionRepository
 from services.llm.gemini_live import GeminiLive
+
 # ACTIVE_LIVE_VOICE removed — prompts moved to prompts/ module
 ACTIVE_LIVE_VOICE = "You are SenteFlow, an AI business assistant for small businesses in East Africa."
-from core.auth import verify_firebase_token, verify_org_access
 
 logger = StructuredLogger(__name__)
 
@@ -44,6 +43,13 @@ _repo: TransactionRepository = None
 def set_repository(repo: TransactionRepository):
     global _repo
     _repo = repo
+
+
+def _require_repo() -> TransactionRepository:
+    """Fail with a clear 503 instead of an AttributeError on `None`."""
+    if _repo is None:
+        raise HTTPException(status_code=503, detail="Repository not initialised")
+    return _repo
 
 
 # ─── Routers ─────────────────────────────────────────────────────────────────
@@ -90,7 +96,10 @@ async def extract(
         tmp_path = tmp.name
 
     try:
-        result, session_id = run_extraction(tmp_path, file.filename or "upload", invoice_prompt)
+        # run_media_extraction blocks on the AI client; keep it off the loop.
+        result, session_id = await asyncio.to_thread(
+            run_media_extraction, tmp_path, file.filename or "upload", invoice_prompt
+        )
         logger.info(
             "extract_complete",
             session_id=session_id,
@@ -153,9 +162,10 @@ async def approve_transactions(req: ApprovalRequest, _token: dict = Depends(veri
     Human approval endpoint. Saves approved transactions with full audit metadata.
     Checks for cross-session duplicates before saving.
     """
+    _require_repo()
     logger.info("approve_request", count=len(req.transactions), org_id=req.org_id, approved_by=req.approved_by)
 
-    saved_ids, skipped = await _repo.save_approved_batch(
+    saved_ids, skipped = _repo.save_approved_batch(
         req.transactions, req.org_id, req.approved_by, req.session_id
     )
 
@@ -169,16 +179,20 @@ async def approve_transactions(req: ApprovalRequest, _token: dict = Depends(veri
 
 
 # ─── Transactions ────────────────────────────────────────────────────────────
+# The repository is synchronous — these handlers stay `async def` so FastAPI
+# keeps them on the event loop, but they must not `await` the repo calls.
 
 @transaction_router.get("/transactions/{org_id}")
 async def get_transactions(org_id: str, status: str = None, limit: int = 100, _: dict = Depends(verify_org_access)):
-    transactions =await _repo.list_transactions(org_id, status=status, limit=limit)
+    _require_repo()
+    transactions = _repo.list_transactions(org_id, status=status, limit=limit)
     return success_response({"transactions": transactions, "count": len(transactions)})
 
 
 @transaction_router.get("/pending/{org_id}")
 async def get_pending(org_id: str, _: dict = Depends(verify_org_access)):
-    transactions =await _repo.list_transactions(org_id, status="pending")
+    _require_repo()
+    transactions = _repo.list_transactions(org_id, status="pending")
     return success_response({"transactions": transactions, "count": len(transactions)})
 
 
@@ -186,13 +200,23 @@ async def get_pending(org_id: str, _: dict = Depends(verify_org_access)):
 
 @summary_router.get("/summary/{org_id}")
 async def get_summary(org_id: str, _: dict = Depends(verify_org_access)):
-    summary =await _repo.compute_financial_summary(org_id)
+    _require_repo()
+    summary = _repo.compute_financial_summary(org_id)
     return success_response(summary.model_dump())
 
 
 @assistant_router.post("/assistant/query")
-async def assistant_query(req: AssistantQueryRequest):
+async def assistant_query(
+    req: AssistantQueryRequest,
+    _token: dict = Depends(verify_firebase_token),
+):
+    from core.auth import ensure_org_access
     from services.assistant.business_assistant import BusinessAssistant
+
+    # org_id arrives in the body here, so the org check has to be explicit —
+    # the Depends(verify_org_access) form only reads query/path parameters.
+    ensure_org_access(_token, req.org_id)
+    _require_repo()
 
     assistant = BusinessAssistant(_repo, req.org_id)
     answer = assistant.answer(req.question, req.sender_id or None)
@@ -205,7 +229,8 @@ async def assistant_query(req: AssistantQueryRequest):
 
 @assistant_router.get("/customers/{org_id}")
 async def get_customers(org_id: str, limit: int = 100, _: dict = Depends(verify_org_access)):
-    customers = await _repo.list_customers(org_id, limit=limit)
+    _require_repo()
+    customers = _repo.list_customers(org_id, limit=limit)
     return success_response({"customers": customers, "count": len(customers)})
 
 
@@ -218,7 +243,8 @@ async def get_orders(
     limit: int = 100,
     _: dict = Depends(verify_org_access),
 ):
-    orders = await _repo.list_orders(
+    _require_repo()
+    orders = _repo.list_orders(
         org_id,
         status=status,
         payment_status=payment_status,
@@ -230,7 +256,8 @@ async def get_orders(
 
 @assistant_router.get("/media-assets/{org_id}")
 async def get_media_assets(org_id: str, limit: int = 50, _: dict = Depends(verify_org_access)):
-    assets = await _repo.list_media_assets(org_id, limit=limit)
+    _require_repo()
+    assets = _repo.list_media_assets(org_id, limit=limit)
     return success_response({"media_assets": assets, "count": len(assets)})
 
 
@@ -238,7 +265,8 @@ async def get_media_assets(org_id: str, limit: int = 50, _: dict = Depends(verif
 
 @audit_router.get("/audit/{org_id}/{transaction_id}")
 async def get_transaction_evidence(org_id: str, transaction_id: str, _: dict = Depends(verify_org_access)):
-    data = await _repo.get_transaction(org_id, transaction_id)
+    _require_repo()
+    data = _repo.get_transaction(org_id, transaction_id)
     if not data:
         raise HTTPException(status_code=404, detail="Transaction not found")
     return success_response({

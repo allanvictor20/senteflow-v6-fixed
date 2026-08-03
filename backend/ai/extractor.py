@@ -33,8 +33,32 @@ from prompts.extraction_prompts import (
 
 logger = logging.getLogger(__name__)
 
-_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 MODEL_ID = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+
+# The client is built on first use, not at import time: constructing it eagerly
+# makes this module unimportable whenever GEMINI_API_KEY is absent, which breaks
+# test collection and any process that only needs the helpers below.
+_client_instance: Optional["genai.Client"] = None
+
+
+def _client_factory() -> "genai.Client":
+    global _client_instance
+    if _client_instance is None:
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is not set — cannot run AI extraction")
+        _client_instance = genai.Client(api_key=api_key)
+    return _client_instance
+
+
+class _LazyClient:
+    """Proxy so existing `_client.models.generate_content(...)` calls still work."""
+
+    def __getattr__(self, name):
+        return getattr(_client_factory(), name)
+
+
+_client = _LazyClient()
 
 
 # ─── Default Confidence Fallback ──────────────────────────────────────────────

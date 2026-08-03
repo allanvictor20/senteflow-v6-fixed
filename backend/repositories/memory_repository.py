@@ -1,10 +1,12 @@
 """Stores and retrieves CustomerMemory objects."""
 
 import asyncio
-from datetime import datetime
+
+
 from typing import Optional
 
 from domain.business_memory.model import CustomerMemory
+from utils.clock import utc_now
 
 
 class MemoryRepository:
@@ -17,7 +19,7 @@ class MemoryRepository:
     async def update_memory(self, org_id: str, memory: CustomerMemory) -> str:
         doc_ref = self._collection(org_id).document(memory.customer_id)
         data = memory.model_dump(mode="json")
-        data["updated_at"] = datetime.utcnow().isoformat()
+        data["updated_at"] = utc_now().isoformat()
         await asyncio.to_thread(doc_ref.set, data, True)
         return memory.customer_id
 

@@ -1,10 +1,12 @@
 """Firestore operations for BusinessConversation objects."""
 
 import asyncio
-from datetime import datetime
+
+
 from typing import Optional
 
 from domain.conversations.model import BusinessConversation
+from utils.clock import utc_now
 
 
 class ConversationRepository:
@@ -17,7 +19,7 @@ class ConversationRepository:
     async def save_conversation(self, org_id: str, conv: BusinessConversation) -> str:
         doc_ref = self._collection(org_id).document(conv.conversation_id)
         data = conv.model_dump(mode="json")
-        data["last_message_at"] = datetime.utcnow().isoformat()
+        data["last_message_at"] = utc_now().isoformat()
         await asyncio.to_thread(doc_ref.set, data, True)
         return conv.conversation_id
 

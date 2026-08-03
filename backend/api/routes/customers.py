@@ -9,7 +9,7 @@ GET  /api/customers/{customer_id}/summary  — AI-generated narrative
 import logging
 from fastapi import APIRouter, Depends, HTTPException
 
-from core.auth import verify_firebase_token, verify_org_access
+from core.auth import verify_firebase_token, ensure_org_access
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ async def list_customers(
     limit: int = 100,
     _token: dict = Depends(verify_firebase_token),
 ):
-    verify_org_access(_token, org_id)
+    ensure_org_access(_token, org_id)
     if not _profile_repo:
         raise HTTPException(500, "Customer repository not initialised")
     profiles = _profile_repo.list(org_id, limit=limit)
@@ -44,7 +44,7 @@ async def get_customer(
     org_id: str,
     _token: dict = Depends(verify_firebase_token),
 ):
-    verify_org_access(_token, org_id)
+    ensure_org_access(_token, org_id)
     profile = _profile_repo.get(org_id, customer_id)
     if not profile:
         raise HTTPException(404, f"Customer {customer_id} not found")
@@ -57,7 +57,7 @@ async def get_customer_summary(
     org_id: str,
     _token: dict = Depends(verify_firebase_token),
 ):
-    verify_org_access(_token, org_id)
+    ensure_org_access(_token, org_id)
     if not _customer_memory_svc:
         raise HTTPException(500, "CustomerMemoryService not initialised")
     summary = await _customer_memory_svc.refresh_ai_summary(org_id, customer_id)

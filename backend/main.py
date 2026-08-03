@@ -26,6 +26,7 @@ Architecture:
 """
 
 import asyncio
+
 import logging
 import os
 
@@ -42,6 +43,7 @@ from firebase_admin import credentials, firestore
 from bootstrap.app_factory import create_app
 from bootstrap.dependency_injection import build_dependencies
 from core.errors import StructuredLogger
+from utils.clock import utc_now
 
 load_dotenv()
 
@@ -51,61 +53,83 @@ logging.basicConfig(
 )
 logger = StructuredLogger(__name__)
 
-# ── Firebase ──────────────────────────────────────────────────────────────────
-if not firebase_admin._apps:
-    cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-    if cred_path and os.path.exists(cred_path):
-        cred = credentials.Certificate(cred_path)
-    else:
-        cred = credentials.ApplicationDefault()
-    firebase_admin.initialize_app(cred)
-
-db = firestore.client()
 org_id = os.environ.get("DEFAULT_ORG_ID", "default")
 
-# ── Dependency wiring ─────────────────────────────────────────────────────────
-deps = build_dependencies(db=db, org_id=org_id)
+# Populated by build() — module-level so the background loops below can reach
+# them once the app has been constructed. `app` is deliberately NOT predefined:
+# the module __getattr__ at the bottom of this file builds it on first access.
+db = None
+deps = None
 
-# ── FastAPI app ───────────────────────────────────────────────────────────────
-app = create_app(deps=deps)
+
+# ── Firebase ──────────────────────────────────────────────────────────────────
+
+def init_firebase():
+    """
+    Initialise the Firebase Admin SDK and return a Firestore client.
+
+    Deliberately a function, not module-level code: importing this module used
+    to open a Firestore connection as a side effect, which made `main` (and so
+    the helpers defined in it) unimportable without live cloud credentials.
+    """
+    if not firebase_admin._apps:
+        cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if cred_path and os.path.exists(cred_path):
+            cred = credentials.Certificate(cred_path)
+        else:
+            cred = credentials.ApplicationDefault()
+        firebase_admin.initialize_app(cred)
+    return firestore.client()
+
+
+def build():
+    """Construct the FastAPI app together with its dependency graph."""
+    global db, deps, app
+    db = init_firebase()
+    deps = build_dependencies(db=db, org_id=org_id)
+    app = create_app(deps=deps)
+    _register_startup_hooks(app)
+    logger.info("senteflow_started", org_id=org_id, version="6.0.0")
+    return app
 
 
 # ── IDEA 07: Proactive background agents ─────────────────────────────────────
 
-@app.on_event("startup")
-async def start_proactive_agents():
-    """
-    IDEA 07: Wire up proactive loops that were built but never started.
-    - reminder_loop: checks for overdue payment promises every hour
-    - daily_briefing_loop: sends owner a morning summary every 24h
+# Long-lived loops need a strong reference, or the event loop may collect them.
+_agent_tasks: set[asyncio.Task] = set()
 
-    Requires wa_client to be configured (EVOLUTION_API_URL + EVOLUTION_API_TOKEN).
-    Gracefully skips if WhatsApp is not configured (dev/test environments).
-    """
-    if deps.wa_client is None:
-        logger.info("proactive_agents_skipped — no WhatsApp client configured")
-        return
 
-    from tasks.reminder_sender import reminder_loop
-    asyncio.create_task(
-        reminder_loop(
-            wa_client=deps.wa_client,
-            repo=deps.repo,
-            org_id=org_id,
-        ),
-        name="reminder_loop",
-    )
-    logger.info("reminder_loop_started")
+def _spawn_agent(coro, name: str) -> None:
+    task = asyncio.create_task(coro, name=name)
+    _agent_tasks.add(task)
+    task.add_done_callback(_agent_tasks.discard)
+    logger.info(f"{name}_started")
 
-    asyncio.create_task(
-        _daily_briefing_loop(
-            wa_client=deps.wa_client,
-            repo=deps.repo,
-            org_id=org_id,
-        ),
-        name="daily_briefing_loop",
-    )
-    logger.info("daily_briefing_loop_started")
+
+def _register_startup_hooks(fastapi_app) -> None:
+    @fastapi_app.on_event("startup")
+    async def start_proactive_agents():
+        """
+        IDEA 07: Wire up proactive loops that were built but never started.
+        - reminder_loop: checks for overdue payment promises every hour
+        - daily_briefing_loop: sends owner a morning summary every 24h
+
+        Requires wa_client to be configured (EVOLUTION_API_URL + EVOLUTION_API_TOKEN).
+        Gracefully skips if WhatsApp is not configured (dev/test environments).
+        """
+        if deps is None or deps.wa_client is None:
+            logger.info("proactive_agents_skipped", reason="no WhatsApp client configured")
+            return
+
+        from tasks.reminder_sender import reminder_loop
+        _spawn_agent(
+            reminder_loop(wa_client=deps.wa_client, repo=deps.repo, org_id=org_id),
+            name="reminder_loop",
+        )
+        _spawn_agent(
+            _daily_briefing_loop(wa_client=deps.wa_client, repo=deps.repo, org_id=org_id),
+            name="daily_briefing_loop",
+        )
 
 
 async def _daily_briefing_loop(wa_client, repo, org_id: str, interval_hours: int = 24) -> None:
@@ -136,7 +160,7 @@ async def _daily_briefing_loop(wa_client, repo, org_id: str, interval_hours: int
     poll_seconds = interval_hours * 3600
     owner_phone = os.environ.get("DEFAULT_OWNER_PHONE")
 
-    logger.info("daily_briefing_loop_running", extra={"interval_h": interval_hours})
+    logger.info("daily_briefing_loop_running", interval_h=interval_hours)
 
     while True:
         # Run briefing first, then sleep — so the first briefing fires on startup
@@ -153,13 +177,13 @@ async def _daily_briefing_loop(wa_client, repo, org_id: str, interval_hours: int
                 try:
                     raw_events = repo.list_transactions(org_id, limit=500) or []
                 except Exception as exc:
-                    logger.warning("briefing_fetch_events_failed", extra={"error": str(exc)})
+                    logger.warning("briefing_fetch_events_failed", error=str(exc))
                     raw_events = []
 
                 try:
                     raw_customers = repo.list_customers(org_id, limit=500) if hasattr(repo, "list_customers") else []
                 except Exception as exc:
-                    logger.warning("briefing_fetch_customers_failed", extra={"error": str(exc)})
+                    logger.warning("briefing_fetch_customers_failed", error=str(exc))
                     raw_customers = []
 
                 # Overdue payment promises
@@ -173,7 +197,7 @@ async def _daily_briefing_loop(wa_client, repo, org_id: str, interval_hours: int
                             amt_str = f" — UGX {float(amt):,.0f}" if amt else ""
                             lines.append(f"  • {name}{amt_str}")
                 except Exception as exc:
-                    logger.warning("briefing_overdue_debts_failed", extra={"error": str(exc)})
+                    logger.warning("briefing_overdue_debts_failed", error=str(exc))
 
                 # Inventory risks (uses event list)
                 try:
@@ -181,7 +205,7 @@ async def _daily_briefing_loop(wa_client, repo, org_id: str, interval_hours: int
                     if inv_risks:
                         lines.append(f"📦 *Stock alerts*: {len(inv_risks)} item(s) at risk")
                 except Exception as exc:
-                    logger.warning("briefing_inventory_failed", extra={"error": str(exc)})
+                    logger.warning("briefing_inventory_failed", error=str(exc))
 
                 # Lost customers (uses customer list, not event list)
                 try:
@@ -189,7 +213,7 @@ async def _daily_briefing_loop(wa_client, repo, org_id: str, interval_hours: int
                     if lost:
                         lines.append(f"👤 *Lost customers*: {len(lost)} not seen in 45+ days")
                 except Exception as exc:
-                    logger.warning("briefing_lost_customers_failed", extra={"error": str(exc)})
+                    logger.warning("briefing_lost_customers_failed", error=str(exc))
 
                 # Revenue trend — key is "trend", not "direction"
                 try:
@@ -202,21 +226,32 @@ async def _daily_briefing_loop(wa_client, repo, org_id: str, interval_hours: int
                             summary = f"{abs(change_pct):.1f}% vs last week"
                             lines.append(f"{emoji} *Revenue*: {summary}")
                 except Exception as exc:
-                    logger.warning("briefing_revenue_failed", extra={"error": str(exc)})
+                    logger.warning("briefing_revenue_failed", error=str(exc))
 
                 if lines:
                     from datetime import datetime
-                    greeting = f"Good morning! Here's your SenteFlow briefing for {datetime.utcnow().strftime('%a %d %b')}:\n\n"
+                    greeting = f"Good morning! Here's your SenteFlow briefing for {utc_now().strftime('%a %d %b')}:\n\n"
                     message = greeting + "\n".join(lines)
                     await wa_client.send_text(owner_phone, message)
-                    logger.info("daily_briefing_sent", extra={"lines": len(lines)})
+                    logger.info("daily_briefing_sent", lines=len(lines))
                 else:
                     logger.info("daily_briefing_nothing_to_report")
 
             except Exception as exc:
-                logger.error("daily_briefing_loop_error", extra={"error": str(exc)})
+                logger.error("daily_briefing_loop_error", error=str(exc))
 
         await asyncio.sleep(poll_seconds)
 
 
-logger.info("senteflow_started", extra={"org_id": org_id, "version": "5.0.0"})
+def __getattr__(name: str):
+    """
+    Build the app on first access to `main.app`.
+
+    `uvicorn main:app` imports this module and then reads the `app` attribute,
+    so the ASGI entry point still works — but merely importing `main` (as the
+    tests do, to reach `_daily_briefing_loop`) no longer requires live Firebase
+    credentials.
+    """
+    if name == "app":
+        return build()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

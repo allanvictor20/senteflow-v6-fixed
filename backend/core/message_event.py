@@ -9,10 +9,12 @@ All layers downstream work only with MessageEvent objects.
 """
 
 from datetime import datetime
+
 from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel, Field
+from utils.clock import utc_now
 
 
 class MessageType(str, Enum):
@@ -57,7 +59,7 @@ class MessageEvent(BaseModel):
     media_url: Optional[str] = Field(None, description="Media download URL")
     media_mime_type: Optional[str] = Field(None)
     media_filename: Optional[str] = Field(None)
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
 
     # Never expose raw_payload in business logic — for debugging only
     raw_payload: Optional[dict] = Field(None, exclude=True)
