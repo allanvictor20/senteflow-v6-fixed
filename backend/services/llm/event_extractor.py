@@ -303,7 +303,9 @@ async def _call_llm(
     raw_type = parsed.get("event_type", "unknown")
     valid_values = {e.value for e in EventType}
     if raw_type not in valid_values:
-        logger.warning("llm_unknown_event_type", extra={"raw": raw_type, "message": message[:60]})
+        # NB: "message" is a reserved LogRecord attribute — putting it in
+        # `extra` raises KeyError inside logging itself.
+        logger.warning("llm_unknown_event_type", extra={"raw": raw_type, "raw_message": message[:60]})
         parsed["event_type"] = "unknown"
 
     for list_key in ("recommended_actions", "operational_effects"):

@@ -22,8 +22,13 @@ export const googleProvider = new GoogleAuthProvider();
 export const signInWithGoogle = () => signInWithPopup(auth, googleProvider);
 export const logOut = () => signOut(auth);
 
+// The backend writes every WhatsApp-derived record to `events`; `transactions`
+// is the pre-v6 collection and is no longer populated. Subscribing to it left
+// the dashboard permanently empty.
+export const EVENTS_COLLECTION = "events";
+
 export const subscribeToTransactions = (orgId, status, callback) => {
-  const ref = collection(db, "organizations", orgId, "transactions");
+  const ref = collection(db, "organizations", orgId, EVENTS_COLLECTION);
   const q = status
     ? query(ref, where("status", "==", status), orderBy("created_at", "desc"))
     : query(ref, orderBy("created_at", "desc"));

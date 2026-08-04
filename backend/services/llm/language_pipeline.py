@@ -18,6 +18,7 @@ Supported languages: Luganda, Runyankole, Ateso, Luo, Swahili
 
 import logging
 import os
+import re
 from typing import Any
 
 import httpx
@@ -83,18 +84,43 @@ def detect_language(text: str) -> dict[str, Any]:
     2. If no match and message is long enough, use LLM detection (async path
        is available via detect_language_with_llm_fallback)
     3. If still no match, default to English with low confidence
+
+    Matching is on whole words. Substring matching mis-classified across
+    languages whenever one language's hint appeared inside another's word —
+    Runyankole "esente" contains Luganda "sente", so every Runyankole message
+    mentioning money was tagged Luganda and translated from the wrong source.
+
+    The language with the most distinct hits wins; ties fall to declaration
+    order, so detection no longer depends on which language happens to be
+    checked first.
     """
-    lowered = (text or "").lower()
+    words = set(re.findall(r"[\w']+", (text or "").lower()))
+    if not words:
+        return {"language": "english", "confidence": 0.6, "source": "default"}
+
+    best_language: str | None = None
+    best_hits: list[str] = []
+
     for language, hints in LOCAL_LANGUAGE_HINTS.items():
-        for hint in hints:
-            if len(hint) >= _MIN_HINT_LENGTH and hint in lowered:
-                return {
-                    "language": language,
-                    "confidence": 0.75,
-                    "source": "keyword",
-                    "matched_hint": hint,
-                }
-    return {"language": "english", "confidence": 0.6, "source": "default"}
+        hits = sorted(
+            {h for h in hints if len(h) >= _MIN_HINT_LENGTH and h in words}
+        )
+        if len(hits) > len(best_hits):
+            best_language, best_hits = language, hits
+
+    if not best_language:
+        return {"language": "english", "confidence": 0.6, "source": "default"}
+
+    # More corroborating words means more confidence, capped so keyword
+    # matching never outranks an explicit LLM identification.
+    confidence = min(0.75 + 0.05 * (len(best_hits) - 1), 0.95)
+    return {
+        "language": best_language,
+        "confidence": round(confidence, 2),
+        "source": "keyword",
+        "matched_hint": best_hits[0],
+        "matched_hints": best_hits,
+    }
 
 
 async def detect_language_with_llm_fallback(text: str) -> dict[str, Any]:

@@ -7,7 +7,7 @@ All tests use the public dispatch() API or the tool classes directly.
 """
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from domain.events.business_event import BusinessEvent
 from domain.events.event_types import EventType
@@ -18,6 +18,7 @@ from services.actions.action_dispatcher import (
     ActionDispatcher,
     ToolResult,
 )
+from utils.clock import utc_now
 
 
 # ── Shared test double ────────────────────────────────────────────────────────
@@ -54,7 +55,7 @@ class TestResolveDueDate:
     def test_explicit_day(self): assert _resolve_due_date("Monday") == "Monday"
 
     def test_tomorrow(self):
-        expected = (datetime.utcnow() + timedelta(days=1)).strftime("%a %d %b")
+        expected = (utc_now() + timedelta(days=1)).strftime("%a %d %b")
         assert _resolve_due_date("tomorrow") == expected
 
     def test_iso_date(self):

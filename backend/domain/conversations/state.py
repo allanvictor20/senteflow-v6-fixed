@@ -7,12 +7,14 @@ States model the business relationship arc: from first inquiry through
 payment, delivery, and completion — with full transition history.
 """
 
-from datetime import datetime
+
+
 from enum import Enum
 from typing import Any, Optional
 import uuid
 
 from pydantic import BaseModel, Field
+from utils.clock import utc_now
 
 
 class ConversationStatus(str, Enum):
@@ -106,7 +108,7 @@ class StateTransitionRecord(BaseModel):
     to_state: str
     trigger_event_id: str
     trigger_event_type: str
-    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = Field(default_factory=lambda: utc_now().isoformat())
     note: str = ""
 
 
@@ -137,7 +139,7 @@ class ConversationAggregate(BaseModel):
 
     # Message context
     last_message: Optional[str] = None
-    last_interaction: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    last_interaction: str = Field(default_factory=lambda: utc_now().isoformat())
 
     # Event history (IDs only — full events stored separately)
     event_ids: list[str] = Field(default_factory=list)
@@ -147,8 +149,8 @@ class ConversationAggregate(BaseModel):
     clarification_question: Optional[str] = None
     clarification_original_text: Optional[str] = None
 
-    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
-    updated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = Field(default_factory=lambda: utc_now().isoformat())
+    updated_at: str = Field(default_factory=lambda: utc_now().isoformat())
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     # ── State Machine ──────────────────────────────────────────────────────────
@@ -184,7 +186,7 @@ class ConversationAggregate(BaseModel):
         )
         self.state_history.append(record)
         self.current_state = new_state
-        self.updated_at = datetime.utcnow().isoformat()
+        self.updated_at = utc_now().isoformat()
         return True
 
     def apply_event(self, event_type: str, event_id: str, entities: dict) -> Optional[ConversationStatus]:
@@ -193,7 +195,7 @@ class ConversationAggregate(BaseModel):
         Returns the new state if a transition occurred, else None.
         """
         self.event_ids.append(event_id)
-        self.last_interaction = datetime.utcnow().isoformat()
+        self.last_interaction = utc_now().isoformat()
         self.updated_at = self.last_interaction
 
         target = EVENT_TO_STATE.get(event_type)

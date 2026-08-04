@@ -12,7 +12,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from core.auth import verify_firebase_token, verify_org_access
+from core.auth import verify_firebase_token, ensure_org_access
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,7 @@ async def list_orders(
     limit: int = 50,
     _token: dict = Depends(verify_firebase_token),
 ):
-    verify_org_access(_token, org_id)
+    ensure_org_access(_token, org_id)
     if not _order_repo:
         raise HTTPException(500, "Order repository not initialised")
 
@@ -58,7 +58,7 @@ async def list_customer_orders(
     org_id: str,
     _token: dict = Depends(verify_firebase_token),
 ):
-    verify_org_access(_token, org_id)
+    ensure_org_access(_token, org_id)
     orders = _order_repo.list_by_customer(org_id, customer_id)
     return {"orders": [o.model_dump(mode="json") for o in orders]}
 
@@ -69,7 +69,7 @@ async def get_order(
     org_id: str,
     _token: dict = Depends(verify_firebase_token),
 ):
-    verify_org_access(_token, org_id)
+    ensure_org_access(_token, org_id)
     order = _order_repo.get(org_id, order_id)
     if not order:
         raise HTTPException(404, f"Order {order_id} not found")
@@ -82,7 +82,7 @@ async def confirm_order(
     org_id: str,
     _token: dict = Depends(verify_firebase_token),
 ):
-    verify_org_access(_token, org_id)
+    ensure_org_access(_token, org_id)
     order = _order_svc.confirm_order(org_id, order_id)
     if not order:
         raise HTTPException(404, "Order not found")
@@ -100,7 +100,7 @@ async def cancel_order(
     body: CancelRequest,
     _token: dict = Depends(verify_firebase_token),
 ):
-    verify_org_access(_token, org_id)
+    ensure_org_access(_token, org_id)
     order = _order_svc.cancel_order(org_id, order_id, body.reason)
     if not order:
         raise HTTPException(404, "Order not found")

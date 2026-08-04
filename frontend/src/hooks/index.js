@@ -52,12 +52,23 @@ export function useTransactions(orgId, status = "approved") {
 }
 
 /** Financial summary, refreshed whenever transactions change */
+// Mirrors domain.models.FinancialSummary so the KPI row reads real fields
+// rather than silently rendering `undefined` for names the backend never sends.
+const EMPTY_SUMMARY = {
+  org_id: "",
+  total_income: 0,
+  total_expenses: 0,
+  balance: 0,
+  total_sales: 0,
+  total_received: 0,
+  pending_amount: 0,
+  members_paid: 0,
+  members_pending: 0,
+  categories: {},
+};
+
 export function useSummary(orgId, transactions) {
-  const [summary, setSummary] = useState({
-    total_income: 0, total_expenses: 0, balance: 0,
-    categories: {}, confidence_distribution: {},
-    members_paid: 0, members_pending: 0, pending_amount: 0,
-  });
+  const [summary, setSummary] = useState(EMPTY_SUMMARY);
   const [summaryError, setSummaryError] = useState(false);
 
   // Build a fingerprint that changes whenever a transaction's status changes,
@@ -69,10 +80,17 @@ export function useSummary(orgId, transactions) {
     .join("|");
 
   useEffect(() => {
+    let active = true;
     setSummaryError(false);
     getOrgSummary(orgId)
-      .then(setSummary)
-      .catch(() => setSummaryError(true));
+      .then((data) => {
+        if (!active) return;
+        setSummary({ ...EMPTY_SUMMARY, ...(data || {}) });
+      })
+      .catch(() => {
+        if (active) setSummaryError(true);
+      });
+    return () => { active = false; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [orgId, transactionFingerprint]);
   return { summary, summaryError };

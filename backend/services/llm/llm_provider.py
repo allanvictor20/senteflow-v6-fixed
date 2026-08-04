@@ -110,14 +110,50 @@ class AllProvidersExhausted(Exception):
 # The result is cached after the first call.
 _cached_provider_chain: list[LLMProvider] | None = None
 
+# Provider order matters: cheapest/fastest first, then fallbacks.
+_PROVIDER_SPECS: list[tuple[str, type[LLMProvider]]] = [
+    ("GEMINI_API_KEY", GeminiProvider),
+    ("ANTHROPIC_API_KEY", ClaudeProvider),
+    ("OPENAI_API_KEY", OpenAIProvider),
+]
+
+
+def _build_provider_chain() -> list[LLMProvider]:
+    """
+    Build the provider chain from whichever API keys are present in the
+    environment. Providers without a configured key are skipped rather than
+    added-and-failed, so the first entry is always a usable provider.
+    """
+    chain = [cls() for env_var, cls in _PROVIDER_SPECS if os.environ.get(env_var)]
+    if not chain:
+        # Never return an empty chain: callers expect at least one provider, and
+        # attempting the primary yields a precise "GEMINI_API_KEY not set" error
+        # rather than a vague "nothing configured".
+        logger.error(
+            "no_llm_providers_configured",
+            extra={"checked": [name for name, _ in _PROVIDER_SPECS]},
+        )
+        return [GeminiProvider()]
+    logger.info("llm_provider_chain_built", extra={"providers": [p.name for p in chain]})
+    return chain
+
 
 def _get_provider_chain() -> list[LLMProvider]:
     """Return (and cache) the provider chain built from current env vars."""
-    global _cached_provider_chain
+    global _cached_provider_chain, PROVIDER_CHAIN
     if _cached_provider_chain is not None:
         return _cached_provider_chain
     _cached_provider_chain = _build_provider_chain()
+    # Keep the legacy module-level name in sync for callers that read it.
+    PROVIDER_CHAIN = _cached_provider_chain
     return _cached_provider_chain
+
+
+def reset_provider_chain() -> None:
+    """Clear the cached chain — used by tests and after env changes."""
+    global _cached_provider_chain, PROVIDER_CHAIN
+    _cached_provider_chain = None
+    PROVIDER_CHAIN = []
 
 
 # Keep PROVIDER_CHAIN as a module-level name for backward compatibility
@@ -141,6 +177,11 @@ async def complete_with_fallback(
     we inspect the API key variables.
     """
     chain = providers or _get_provider_chain()
+    if not chain:
+        raise AllProvidersExhausted(
+            "No LLM provider is configured. Set at least one of "
+            "GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY."
+        )
     last_exc: Exception | None = None
 
     for provider in chain:

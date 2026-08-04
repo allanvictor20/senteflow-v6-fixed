@@ -27,11 +27,13 @@ import logging
 import mimetypes
 import os
 import uuid
-from datetime import datetime
+
+
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from integrations.whatsapp.client import EvolutionClient
+from utils.clock import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +106,7 @@ async def download_and_save_media(
     ext = _MIME_TO_EXT.get(mime_type) or mimetypes.guess_extension(mime_type or "") or ".bin"
 
     safe_sender = sender_id.split("@")[0].replace("+", "")
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    timestamp = utc_now().strftime("%Y%m%d_%H%M%S")
     short_id = str(uuid.uuid4())[:8]
     filename = f"{source_hint}_{safe_sender}_{timestamp}_{short_id}{ext}"
 

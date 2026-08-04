@@ -4,10 +4,12 @@ SenteFlow AI - Business Memory
 Customer knowledge accumulated across WhatsApp conversations.
 """
 
-from datetime import datetime
+
+
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
+from utils.clock import utc_now
 
 
 class CustomerMemory(BaseModel):
@@ -32,7 +34,7 @@ class CustomerMemory(BaseModel):
     notes: list[str] = Field(default_factory=list)
     last_conversation_stage: str = "unknown"
     open_promises: list[dict] = Field(default_factory=list)
-    updated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    updated_at: str = Field(default_factory=lambda: utc_now().isoformat())
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     def to_ai_context(self) -> str:

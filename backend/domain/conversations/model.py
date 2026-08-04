@@ -4,12 +4,14 @@ SenteFlow AI - Business Conversation
 Tracks an active WhatsApp thread with a customer or supplier.
 """
 
-from datetime import datetime
+
+
 from enum import Enum
 from typing import Any, Optional
 import uuid
 
 from pydantic import BaseModel, Field
+from utils.clock import utc_now
 
 
 class ConversationStage(str, Enum):
@@ -45,8 +47,8 @@ class BusinessConversation(BaseModel):
     expected_payment_amount: Optional[float] = None
     expected_payment_date: Optional[str] = None
     items_discussed: list[str] = Field(default_factory=list)
-    started_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
-    last_message_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    started_at: str = Field(default_factory=lambda: utc_now().isoformat())
+    last_message_at: str = Field(default_factory=lambda: utc_now().isoformat())
     resolved_at: Optional[str] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 

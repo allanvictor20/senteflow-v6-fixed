@@ -7,12 +7,14 @@ extractor because invoice structure differs significantly from voice/text record
 """
 
 import logging
+
 import os
 from typing import Optional
 
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai.types import GenerateContentConfig, Part
+from utils.clock import utc_now
 
 # ACTIVE_INVOICE_EXTRACTION removed — define inline or in prompts/ module
 ACTIVE_INVOICE_EXTRACTION = "Extract invoice details from the following text."
@@ -107,7 +109,7 @@ def invoice_to_transactions(invoice: InvoiceData) -> list[dict]:
     These are passed to the validation layer before use.
     """
     from datetime import datetime
-    now = datetime.utcnow().isoformat()
+    now = utc_now().isoformat()
 
     txn_type_map = {
         "supplier_invoice": "expense",

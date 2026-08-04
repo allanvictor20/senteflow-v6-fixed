@@ -12,12 +12,14 @@ rich CustomerProfile that answers:
 """
 
 from datetime import datetime
+
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 import uuid
+from utils.clock import utc_now
 
 
 class PaymentBehavior(str, Enum):
@@ -53,8 +55,8 @@ class CustomerProfile(BaseModel):
     aliases: list[str] = Field(default_factory=list)
 
     # Lifecycle
-    first_seen_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
-    last_seen_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    first_seen_at: str = Field(default_factory=lambda: utc_now().isoformat())
+    last_seen_at: str = Field(default_factory=lambda: utc_now().isoformat())
 
     # Financial summary
     total_orders: int = 0
@@ -86,7 +88,7 @@ class CustomerProfile(BaseModel):
     ai_summary: Optional[str] = None
     ai_summary_generated_at: Optional[str] = None
 
-    updated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    updated_at: str = Field(default_factory=lambda: utc_now().isoformat())
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     # ── Helpers ────────────────────────────────────────────────────────────────
@@ -113,14 +115,14 @@ class CustomerProfile(BaseModel):
     def months_as_customer(self) -> float:
         try:
             first = datetime.fromisoformat(self.first_seen_at.replace("Z", "+00:00"))
-            delta = datetime.utcnow() - first.replace(tzinfo=None)
+            delta = utc_now() - first.replace(tzinfo=None)
             return round(delta.days / 30, 1)
         except Exception:
             return 0.0
 
     def update_from_event(self, event_type: str, entities: dict) -> None:
         """Mutate this profile based on an incoming BusinessEvent."""
-        now = datetime.utcnow().isoformat()
+        now = utc_now().isoformat()
         self.last_seen_at = now
         self.updated_at = now
 

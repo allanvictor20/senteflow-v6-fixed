@@ -7,12 +7,14 @@ Every WhatsApp-originated purchase flows through an Order lifecycle
 with state transitions, an event timeline, and payment/delivery tracking.
 """
 
-from datetime import datetime
+
+
 from enum import Enum
 from typing import Any, Optional
 import uuid
 
 from pydantic import BaseModel, Field
+from utils.clock import utc_now
 
 
 class OrderStatus(str, Enum):
@@ -53,7 +55,7 @@ class OrderItem(BaseModel):
 class OrderTimelineEntry(BaseModel):
     status: str
     note: str = ""
-    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = Field(default_factory=lambda: utc_now().isoformat())
     actor: str = "system"   # "customer" | "business" | "system"
 
 
@@ -99,15 +101,15 @@ class Order(BaseModel):
     notes: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
 
-    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
-    updated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = Field(default_factory=lambda: utc_now().isoformat())
+    updated_at: str = Field(default_factory=lambda: utc_now().isoformat())
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
     def add_timeline_entry(self, status: str, note: str = "", actor: str = "system") -> None:
         self.timeline.append(OrderTimelineEntry(status=status, note=note, actor=actor))
-        self.updated_at = datetime.utcnow().isoformat()
+        self.updated_at = utc_now().isoformat()
 
     def confirm(self) -> None:
         self.status = OrderStatus.CONFIRMED

@@ -38,15 +38,30 @@ async def verify_firebase_token(authorization: str = Header(default=None)) -> di
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 
-async def verify_org_access(org_id: str, token: dict = Depends(verify_firebase_token)) -> dict:
+def ensure_org_access(token: dict, org_id: str) -> dict:
+    """
+    Assert that `token`'s user is a member of `org_id`.
+
+    This is a plain function, not a FastAPI dependency, so route bodies can
+    call it inline: `ensure_org_access(_token, org_id)`. Calling the async
+    `verify_org_access` that way produced an un-awaited coroutine and checked
+    nothing at all — any valid token reached any org's data.
+
+    Raises HTTPException(403) when the user is not a member.
+    """
     if not _REQUIRE_AUTH:
         return token
-    uid = token.get("uid")
+    uid = (token or {}).get("uid")
     if not uid:
         raise HTTPException(status_code=403, detail="Token missing uid")
     try:
         import firebase_admin.firestore as fs
-        doc = fs.client().collection("organizations").document(org_id).collection("members").document(uid).get()
+        doc = (
+            fs.client()
+            .collection("organizations").document(org_id)
+            .collection("members").document(uid)
+            .get()
+        )
         if not doc.exists:
             logger.warning("org_access_denied", extra={"uid": uid, "org_id": org_id})
             raise HTTPException(status_code=403, detail="Access denied to this organization")
@@ -56,3 +71,8 @@ async def verify_org_access(org_id: str, token: dict = Depends(verify_firebase_t
         logger.error("org_access_check_failed", extra={"error": str(exc)})
         raise HTTPException(status_code=500, detail="Could not verify org access")
     return token
+
+
+async def verify_org_access(org_id: str, token: dict = Depends(verify_firebase_token)) -> dict:
+    """FastAPI dependency form — use with `Depends(verify_org_access)`."""
+    return ensure_org_access(token, org_id)

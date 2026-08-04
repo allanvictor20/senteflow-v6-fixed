@@ -5,9 +5,11 @@ Customers are first-class citizens with their own Firestore collection.
 """
 
 import logging
-from datetime import datetime
+
+
 from typing import Optional
 from domain.customers.model import Customer
+from utils.clock import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +29,7 @@ class CustomerRepository:
     def upsert_customer(self, org_id: str, customer: Customer) -> str:
         doc_ref = self._collection(org_id).document(customer.customer_id)
         data = customer.model_dump(mode="json")
-        data["updated_at"] = datetime.utcnow().isoformat()
+        data["updated_at"] = utc_now().isoformat()
         doc_ref.set(data, merge=True)
         return customer.customer_id
 
@@ -55,7 +57,7 @@ class CustomerRepository:
         data = doc_ref.get().to_dict() or {}
         if direction == "paid":
             new_val = data.get("total_paid", 0.0) + amount_delta
-            doc_ref.update({"total_paid": new_val, "updated_at": datetime.utcnow().isoformat()})
+            doc_ref.update({"total_paid": new_val, "updated_at": utc_now().isoformat()})
         elif direction == "owed":
             new_val = data.get("total_owed", 0.0) + amount_delta
-            doc_ref.update({"total_owed": new_val, "updated_at": datetime.utcnow().isoformat()})
+            doc_ref.update({"total_owed": new_val, "updated_at": utc_now().isoformat()})

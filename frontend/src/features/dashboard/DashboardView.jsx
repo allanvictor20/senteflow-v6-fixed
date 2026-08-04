@@ -1,7 +1,6 @@
 import { useState, useEffect } from "react";
 import { C, s } from "../../utils/theme";
 import { fmt } from "../../utils/format";
-import { InfoPill } from "../../components/ui";
 import { getCustomers, getMediaAssets, getOrders } from "../../services/api";
 import KpiCard from "./KpiCard";
 import WhatsAppStatusCard from "./WhatsAppStatusCard";
@@ -14,19 +13,19 @@ export default function DashboardView({ summary, summaryError, transactions, ale
   useEffect(() => {
     let active = true;
     setFetchError(false);
-    Promise.all([
+    // allSettled, not all: one failing panel shouldn't blank the other two.
+    Promise.allSettled([
       getOrders(orgId),
       getCustomers(orgId),
       getMediaAssets(orgId),
     ]).then(([orders, customers, media]) => {
       if (!active) return;
       setControlData({
-        orders: orders.orders || [],
-        customers: customers.customers || [],
-        media_assets: media.media_assets || [],
+        orders: orders.value?.orders || [],
+        customers: customers.value?.customers || [],
+        media_assets: media.value?.media_assets || [],
       });
-    }).catch(() => {
-      if (active) setFetchError(true);
+      setFetchError([orders, customers, media].some((r) => r.status === "rejected"));
     });
     return () => { active = false; };
   }, [orgId, transactions.length]);
@@ -66,7 +65,7 @@ export default function DashboardView({ summary, summaryError, transactions, ale
       <div style={s.cardGrid4}>
         <KpiCard label="Events Today" value={transactions.length} color={C.accent} sub="from WhatsApp and uploads" />
         <KpiCard label="Follow-ups Needed" value={pendingDeliveries.length + alerts.length} color={C.yellow} />
-        <KpiCard label="Revenue This Week" value={fmt(revenueThisWeek || summary.total_income)} color={C.green} />
+        <KpiCard label="Revenue This Week" value={fmt(revenueThisWeek || summary.total_income || 0)} color={C.green} />
         <KpiCard label="Customers Active" value={controlData.customers.length} color={C.white} sub={`${unpaidOrders.length} unresolved`} />
       </div>
 

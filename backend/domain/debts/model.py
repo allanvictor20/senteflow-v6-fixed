@@ -8,9 +8,11 @@ When a payment_received event arrives, the matching debt is reduced or resolved.
 
 import uuid
 from datetime import datetime
+
 from enum import Enum
 from typing import Optional
 from pydantic import BaseModel, Field
+from utils.clock import utc_now
 
 
 class DebtStatus(str, Enum):
@@ -40,8 +42,8 @@ class Debt(BaseModel):
     source_message: str = ""
     notes: str = ""
 
-    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
-    updated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = Field(default_factory=lambda: utc_now().isoformat())
+    updated_at: str = Field(default_factory=lambda: utc_now().isoformat())
 
     def apply_payment(self, amount: float) -> "Debt":
         """Return a new Debt with the payment applied."""
@@ -50,13 +52,13 @@ class Debt(BaseModel):
         return self.model_copy(update={
             "outstanding_amount": remaining,
             "status": status,
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": utc_now().isoformat(),
         })
 
     def is_overdue(self) -> bool:
         if not self.due_date:
             return False
         try:
-            return datetime.fromisoformat(self.due_date) < datetime.utcnow()
+            return datetime.fromisoformat(self.due_date) < utc_now()
         except ValueError:
             return False

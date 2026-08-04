@@ -4,9 +4,11 @@ SenteFlow AI — Customer Domain Model
 Customers are first-class citizens built up over time from interactions.
 """
 
-from datetime import datetime
+
+
 from typing import Optional, Any
 from pydantic import BaseModel, Field
+from utils.clock import utc_now
 
 
 class Customer(BaseModel):
@@ -23,6 +25,6 @@ class Customer(BaseModel):
     last_interaction: Optional[str] = None
     risk_level: str = "unknown"
     notes: list[str] = Field(default_factory=list)
-    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
-    updated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = Field(default_factory=lambda: utc_now().isoformat())
+    updated_at: str = Field(default_factory=lambda: utc_now().isoformat())
     metadata: dict[str, Any] = Field(default_factory=dict)

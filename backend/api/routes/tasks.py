@@ -10,7 +10,7 @@ POST /api/tasks/{task_id}/dismiss
 import logging
 from fastapi import APIRouter, Depends, HTTPException
 
-from core.auth import verify_firebase_token, verify_org_access
+from core.auth import verify_firebase_token, ensure_org_access
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ async def list_tasks(
     limit: int = 100,
     _token: dict = Depends(verify_firebase_token),
 ):
-    verify_org_access(_token, org_id)
+    ensure_org_access(_token, org_id)
     if not _task_repo:
         raise HTTPException(500, "Task repository not initialised")
     tasks = _task_repo.list_active(org_id, limit=limit)
@@ -42,7 +42,7 @@ async def list_overdue_tasks(
     org_id: str,
     _token: dict = Depends(verify_firebase_token),
 ):
-    verify_org_access(_token, org_id)
+    ensure_org_access(_token, org_id)
     tasks = _task_repo.list_overdue(org_id)
     return {"tasks": [t.model_dump(mode="json") for t in tasks]}
 
@@ -53,7 +53,7 @@ async def list_customer_tasks(
     org_id: str,
     _token: dict = Depends(verify_firebase_token),
 ):
-    verify_org_access(_token, org_id)
+    ensure_org_access(_token, org_id)
     tasks = _task_repo.list_by_customer(org_id, customer_id)
     return {"tasks": [t.model_dump(mode="json") for t in tasks]}
 
@@ -64,7 +64,7 @@ async def complete_task(
     org_id: str,
     _token: dict = Depends(verify_firebase_token),
 ):
-    verify_org_access(_token, org_id)
+    ensure_org_access(_token, org_id)
     _task_repo.complete_task(org_id, task_id, by="user")
     return {"status": "completed", "task_id": task_id}
 
@@ -75,7 +75,7 @@ async def dismiss_task(
     org_id: str,
     _token: dict = Depends(verify_firebase_token),
 ):
-    verify_org_access(_token, org_id)
+    ensure_org_access(_token, org_id)
     task = _task_repo.get(org_id, task_id)
     if not task:
         raise HTTPException(404, "Task not found")

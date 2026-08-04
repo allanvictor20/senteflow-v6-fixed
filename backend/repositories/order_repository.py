@@ -5,10 +5,12 @@ Firestore persistence for Orders.
 """
 
 import logging
-from datetime import datetime
+
+
 from typing import Optional
 
 from domain.orders.model import Order, OrderStatus
+from utils.clock import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +29,7 @@ class OrderRepository:
 
     def save(self, org_id: str, order: Order) -> str:
         order.org_id = org_id
-        order.updated_at = datetime.utcnow().isoformat()
+        order.updated_at = utc_now().isoformat()
         self._col(org_id).document(order.id).set(order.model_dump(mode="json"), merge=True)
         logger.debug("order_saved", extra={"order_id": order.id, "status": order.status})
         return order.id
@@ -76,7 +78,7 @@ class OrderRepository:
     def update_status(self, org_id: str, order_id: str, status: OrderStatus) -> None:
         self._col(org_id).document(order_id).update({
             "status": status.value,
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": utc_now().isoformat(),
         })
 
     def get_active_for_customer(self, org_id: str, customer_id: str) -> Optional[Order]:

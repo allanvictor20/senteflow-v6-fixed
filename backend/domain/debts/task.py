@@ -7,12 +7,14 @@ The task engine converts conversational signals into concrete to-dos
 the business owner must act on — without them having to track anything manually.
 """
 
-from datetime import datetime
+
+
 from enum import Enum
 from typing import Any, Optional
 import uuid
 
 from pydantic import BaseModel, Field
+from utils.clock import utc_now
 
 
 class TaskPriority(str, Enum):
@@ -71,24 +73,24 @@ class BusinessTask(BaseModel):
     completed_by: Optional[str] = None
     notes: list[str] = Field(default_factory=list)
 
-    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
-    updated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = Field(default_factory=lambda: utc_now().isoformat())
+    updated_at: str = Field(default_factory=lambda: utc_now().isoformat())
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     def complete(self, by: str = "system") -> None:
         self.status = TaskStatus.COMPLETED
-        self.completed_at = datetime.utcnow().isoformat()
+        self.completed_at = utc_now().isoformat()
         self.completed_by = by
-        self.updated_at = datetime.utcnow().isoformat()
+        self.updated_at = utc_now().isoformat()
 
     def dismiss(self) -> None:
         self.status = TaskStatus.DISMISSED
-        self.updated_at = datetime.utcnow().isoformat()
+        self.updated_at = utc_now().isoformat()
 
     def mark_overdue(self) -> None:
         if self.status == TaskStatus.PENDING:
             self.status = TaskStatus.OVERDUE
-            self.updated_at = datetime.utcnow().isoformat()
+            self.updated_at = utc_now().isoformat()
 
     def is_active(self) -> bool:
         return self.status in (TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.OVERDUE)

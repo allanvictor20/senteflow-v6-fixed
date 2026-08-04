@@ -13,7 +13,9 @@ having to track it manually.
 
 import logging
 from datetime import datetime, timedelta
+
 from typing import Any, Optional, TYPE_CHECKING
+from utils.clock import utc_now
 
 if TYPE_CHECKING:
     from repositories.transaction_repository import TransactionRepository
@@ -38,7 +40,7 @@ async def update_from_event(event: dict, org_id: str, memory_repo, customer_repo
         "customer_id": customer_id,
         "org_id": org_id,
         "display_name": customer.get("display_name") or existing.get("display_name") or "Unknown",
-        "last_contact": datetime.utcnow().isoformat(),
+        "last_contact": utc_now().isoformat(),
     }
 
     if event_type in ("payment_received", "payment", "income"):
@@ -64,7 +66,7 @@ async def update_from_event(event: dict, org_id: str, memory_repo, customer_repo
             "type": "payment",
             "amount": amount,
             "due": entities.get("due_date"),
-            "recorded_at": datetime.utcnow().isoformat(),
+            "recorded_at": utc_now().isoformat(),
         })
         updates["open_promises"] = promises
 
@@ -117,7 +119,7 @@ class BusinessMemoryEngine:
             "entities": business_event.entities,
             "raw_message": business_event.raw_message,
             "sender_id": business_event.sender_id,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": utc_now().isoformat(),
             "status": "pending",
             "org_id": self.org_id,
         }
@@ -133,7 +135,7 @@ class BusinessMemoryEngine:
             "type": "low_stock_alert",
             "event_id": business_event.event_id,
             "entities": business_event.entities,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": utc_now().isoformat(),
             "status": "open",
             "org_id": self.org_id,
         }
@@ -207,7 +209,7 @@ class BusinessMemoryEngine:
     def get_overdue_promises(self, days_threshold: int = 2) -> list[dict]:
         """Return promises that are older than `days_threshold` days without resolution."""
         all_promises = self.get_unresolved_promises()
-        threshold = datetime.utcnow() - timedelta(days=days_threshold)
+        threshold = utc_now() - timedelta(days=days_threshold)
         overdue = []
         for p in all_promises:
             created = p.get("created_at", "")
@@ -262,7 +264,7 @@ class BusinessMemoryEngine:
         try:
             self.repo._db.collection("organizations").document(self.org_id)\
                 .collection("promises").document(event_id)\
-                .update({"status": "resolved", "resolved_at": datetime.utcnow().isoformat()})
+                .update({"status": "resolved", "resolved_at": utc_now().isoformat()})
             return True
         except Exception as exc:
             logger.warning("promise_resolve_failed", extra={"error": str(exc)})

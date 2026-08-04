@@ -6,9 +6,11 @@ datetime object comparison, which correctly handles timestamps that
 have "Z" suffixes or "+00:00" timezones.
 """
 import pytest
-from datetime import datetime, timedelta
+from datetime import timedelta
+
 from unittest.mock import MagicMock, AsyncMock, patch
 from tasks.reminder_sender import send_overdue_reminders, _format_reminder_message
+from utils.clock import utc_now
 
 
 def _make_doc(doc_id, created_at, sender_id="owner-123", debtor="Brian", amount=50000):
@@ -46,7 +48,7 @@ class TestDatetimeComparison:
     @pytest.mark.asyncio
     async def test_overdue_reminder_is_sent(self):
         """A reminder created 48h ago should be sent."""
-        old_ts = (datetime.utcnow() - timedelta(hours=48)).isoformat()
+        old_ts = (utc_now() - timedelta(hours=48)).isoformat()
         doc = _make_doc("doc-1", old_ts)
         repo = _make_repo([doc])
 
@@ -58,7 +60,7 @@ class TestDatetimeComparison:
     @pytest.mark.asyncio
     async def test_recent_reminder_is_not_sent(self):
         """A reminder created 1h ago should NOT be sent (not yet overdue)."""
-        new_ts = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+        new_ts = (utc_now() - timedelta(hours=1)).isoformat()
         doc = _make_doc("doc-2", new_ts)
         repo = _make_repo([doc])
 
@@ -70,7 +72,7 @@ class TestDatetimeComparison:
     @pytest.mark.asyncio
     async def test_z_suffix_timestamp_handled_correctly(self):
         """Timestamps with trailing 'Z' must parse correctly (pre-fix they could fail)."""
-        old_ts = (datetime.utcnow() - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        old_ts = (utc_now() - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ")
         doc = _make_doc("doc-3", old_ts)
         repo = _make_repo([doc])
 
@@ -92,7 +94,7 @@ class TestDatetimeComparison:
     @pytest.mark.asyncio
     async def test_reminder_marked_notified_after_send(self):
         """After sending, the reminder doc must be updated to status='notified'."""
-        old_ts = (datetime.utcnow() - timedelta(hours=48)).isoformat()
+        old_ts = (utc_now() - timedelta(hours=48)).isoformat()
         doc = _make_doc("doc-5", old_ts)
         repo = _make_repo([doc])
 

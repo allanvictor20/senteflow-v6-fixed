@@ -14,6 +14,8 @@ This route does NOTHING except:
 All actual processing happens in the background task.
 """
 
+import hmac
+import json
 import logging
 import os
 
@@ -41,9 +43,58 @@ def set_whatsapp_dependencies(wa_client: EvolutionClient, message_router: Messag
     _router = message_router
 
 
+# ─── Authentication ───────────────────────────────────────────────────────────
+
+def _authenticate_webhook(request: Request, raw_body: bytes, payload: dict) -> None:
+    """
+    Accept the request only if it proves it came from our Evolution instance.
+
+    Two mechanisms are supported, in order of preference:
+      1. HMAC-SHA256 over the raw body, keyed by WEBHOOK_SECRET
+      2. A shared secret in the `apikey` header, matching EVOLUTION_API_KEY
+
+    In production at least one must be configured. Without that guard anyone
+    who learns the URL can inject fabricated messages into the pipeline.
+    """
+    from integrations.whatsapp.webhook_handler import verify_webhook_signature
+
+    webhook_secret = os.environ.get("WEBHOOK_SECRET", "")
+    expected_key = os.environ.get("EVOLUTION_API_KEY", "")
+    is_production = os.environ.get("ENVIRONMENT", "production").lower() in ("production", "prod")
+
+    if webhook_secret:
+        sig_header = request.headers.get("x-webhook-signature", "")
+        if not verify_webhook_signature(raw_body, sig_header or None, webhook_secret):
+            logger.warning("webhook_signature_invalid")
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
+        return
+
+    if expected_key:
+        incoming_key = (
+            request.headers.get("apikey")
+            or request.headers.get("x-api-key")
+            or payload.get("apikey", "")
+        )
+        if not hmac.compare_digest(str(incoming_key), expected_key):
+            logger.warning(
+                "webhook_unauthorized",
+                incoming_key=(incoming_key[:6] + "***") if incoming_key else "missing",
+            )
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        return
+
+    if is_production:
+        logger.error("webhook_auth_not_configured")
+        raise HTTPException(
+            status_code=503,
+            detail="Webhook authentication is not configured",
+        )
+
+    logger.warning("webhook_auth_skipped_dev_mode")
+
+
 # ─── Webhook Endpoint ─────────────────────────────────────────────────────────
 
-@whatsapp_router.post("/whatsapp")
 @whatsapp_router.post("/whatsapp")
 async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
     """
@@ -53,33 +104,14 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
     """
     raw_body = await request.body()
 
-    # ── HMAC signature check (when WEBHOOK_SECRET is set) ──────────────────
-    from integrations.whatsapp.webhook_handler import verify_webhook_signature
-    webhook_secret = os.environ.get("WEBHOOK_SECRET", "")
-    sig_header = request.headers.get("x-webhook-signature", "")
-    if not verify_webhook_signature(raw_body, sig_header or None, webhook_secret or None):
-        logger.warning("webhook_signature_invalid")
-        raise HTTPException(status_code=401, detail="Invalid webhook signature")
-
-    # ── Fallback: plain API key check (Evolution global key) ───────────────
     try:
-        payload = __import__("json").loads(raw_body)
+        payload = json.loads(raw_body)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Webhook payload must be a JSON object")
 
-    expected_key = os.environ.get("EVOLUTION_API_KEY", "")
-    if not webhook_secret and expected_key:
-        incoming_key = (
-            request.headers.get("apikey")
-            or request.headers.get("x-api-key")
-            or payload.get("apikey", "")
-        )
-        if incoming_key != expected_key:
-            logger.warning(
-                "webhook_unauthorized",
-                incoming_key=incoming_key[:6] + "***" if incoming_key else "missing",
-            )
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    _authenticate_webhook(request, raw_body, payload)
 
     event = normalize_message(payload)
     if event is None:
@@ -92,20 +124,29 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
         event_id=event.event_id,
     )
 
-    if _router:
+    if not _router:
+        logger.error("message_router_not_initialized")
+        raise HTTPException(status_code=503, detail="WhatsApp router not initialised")
+
+    try:
+        # De-duplicate on the WhatsApp message id, not event.event_id: the
+        # latter is a fresh uuid4 minted per normalisation, so an Evolution
+        # retry of the same message would produce a different key every time
+        # and be processed again.
         created, queue_id = _router.repo.enqueue_webhook_event(
             org_id=_router.org_id,
-            event_id=event.event_id,
+            event_id=event.message_id,
             payload=payload,
             normalized_event=event.model_dump(mode="json"),
         )
-        if created:
-            background_tasks.add_task(_process_queued_event, queue_id)
-        else:
-            return JSONResponse({"status": "duplicate", "event_id": event.event_id}, status_code=200)
-    else:
-        logger.error("message_router_not_initialized")
+    except Exception as exc:
+        logger.error("webhook_enqueue_failed", error=str(exc), event_id=event.event_id)
+        raise HTTPException(status_code=503, detail="Could not queue webhook event")
 
+    if not created:
+        return JSONResponse({"status": "duplicate", "event_id": event.event_id}, status_code=200)
+
+    background_tasks.add_task(_process_queued_event, queue_id)
     return JSONResponse({"status": "queued", "event_id": event.event_id}, status_code=200)
 
 async def _process_queued_event(queue_id: str):

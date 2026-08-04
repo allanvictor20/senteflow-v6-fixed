@@ -6,10 +6,12 @@ one user, one message, optional text, optional media, and a timestamp.
 """
 
 from datetime import datetime
+
 from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel, Field
+from utils.clock import utc_now
 
 
 class InputType(str, Enum):
@@ -27,7 +29,7 @@ class MessageEvent(BaseModel):
     input_type: InputType = Field(InputType.UNKNOWN)
     text: Optional[str] = None
     media_path: Optional[str] = None
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
     chat_id: Optional[str] = None
     message_id: Optional[str] = None
     confidence_hint: Optional[float] = Field(None, ge=0.0, le=1.0)
@@ -50,7 +52,7 @@ class MessageEvent(BaseModel):
             input_type=input_type,
             text=getattr(event, "text", None),
             media_path=media_path,
-            timestamp=getattr(event, "timestamp", datetime.utcnow()),
+            timestamp=getattr(event, "timestamp", utc_now()),
             chat_id=getattr(event, "chat_id", None),
             message_id=getattr(event, "message_id", None),
         )

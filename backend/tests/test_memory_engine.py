@@ -4,10 +4,12 @@ All Firestore calls replaced with FakeRepo / FakeFirestore stubs.
 """
 import pytest
 from unittest.mock import MagicMock, AsyncMock
-from datetime import datetime, timedelta
+from datetime import timedelta
+
 from services.memory.memory_engine import BusinessMemoryEngine
 from domain.events.event_types import EventType
 from domain.events.business_event import BusinessEvent
+from utils.clock import utc_now
 
 
 class FakeCollection:
@@ -104,7 +106,7 @@ class TestBusinessMemoryEngine:
             "event_id": old_event.event_id,
             "entities": {},
             "sender_id": "s1",
-            "created_at": (datetime.utcnow() - timedelta(days=5)).isoformat(),
+            "created_at": (utc_now() - timedelta(days=5)).isoformat(),
             "status": "pending",
             "org_id": "org-1",
         }
@@ -117,7 +119,7 @@ class TestBusinessMemoryEngine:
     def test_get_overdue_promises_excludes_recent(self):
         engine, _ = self._engine()
         recent_doc = {
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": utc_now().isoformat(),
             "status": "pending",
         }
         engine.get_unresolved_promises = lambda: [recent_doc]

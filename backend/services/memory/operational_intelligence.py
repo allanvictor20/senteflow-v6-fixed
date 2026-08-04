@@ -8,6 +8,7 @@ write to the database.
 """
 
 from datetime import datetime, timedelta
+from utils.clock import utc_now
 
 
 def _parse_dt(value):
@@ -22,7 +23,7 @@ def _parse_dt(value):
 
 
 def detect_lost_customers(customers: list[dict], days_threshold: int = 45) -> list[dict]:
-    cutoff = datetime.utcnow() - timedelta(days=days_threshold)
+    cutoff = utc_now() - timedelta(days=days_threshold)
     lost = []
     for customer in customers:
         last_dt = _parse_dt(customer.get("last_interaction") or customer.get("last_contact"))
@@ -30,7 +31,7 @@ def detect_lost_customers(customers: list[dict], days_threshold: int = 45) -> li
             lost.append({
                 "customer_id": customer.get("customer_id") or customer.get("id"),
                 "display_name": customer.get("display_name"),
-                "days_since_contact": (datetime.utcnow() - last_dt).days,
+                "days_since_contact": (utc_now() - last_dt).days,
                 "outstanding_balance": customer.get("outstanding_balance", customer.get("total_owed", 0)),
             })
     return sorted(lost, key=lambda item: item["days_since_contact"], reverse=True)
@@ -52,7 +53,7 @@ def detect_repeat_customers(events: list[dict], min_purchases: int = 3) -> list[
 
 
 def detect_overdue_debts(events: list[dict]) -> list[dict]:
-    today = datetime.utcnow()
+    today = utc_now()
     overdue = []
     for event in events:
         if (event.get("event_type") or event.get("type")) != "payment_promise":
@@ -71,7 +72,7 @@ def detect_overdue_debts(events: list[dict]) -> list[dict]:
 
 
 def detect_inventory_risk(events: list[dict]) -> list[dict]:
-    cutoff = datetime.utcnow() - timedelta(days=7)
+    cutoff = utc_now() - timedelta(days=7)
     low_stock_items: dict[str, dict] = {}
     restocked_items: set[str] = set()
 
@@ -97,7 +98,7 @@ def detect_inventory_risk(events: list[dict]) -> list[dict]:
 
 
 def detect_revenue_trends(events: list[dict]) -> dict:
-    now = datetime.utcnow()
+    now = utc_now()
     week_ago = now - timedelta(days=7)
     two_weeks_ago = now - timedelta(days=14)
     this_week = 0.0
