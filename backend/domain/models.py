@@ -113,7 +113,7 @@ class SourceTrace(BaseModel):
     transcript_snippet: Optional[str] = None
     media_id: Optional[str] = None
     page_number: Optional[int] = None
-    extraction_model: str = "gemini-2.0-flash"
+    extraction_model: str = "llama-3.3-70b-versatile"
     extraction_prompt_version: str = "1"
 
     @property

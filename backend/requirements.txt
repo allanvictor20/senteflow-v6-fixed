@@ -1,9 +1,9 @@
-# SenteFlow AI - Backend Dependencies (v5)
+# SenteFlow AI - Backend Dependencies (v6 — Groq migration)
 
-# Primary LLM: Gemini (with multi-provider fallback — IDEA 06)
-google-genai>=1.0.0
+# Primary LLM: Groq (OpenAI-compatible API)
+groq>=0.11.0
 
-# Fallback LLM providers (IDEA 06 — optional, configure via env vars)
+# Fallback LLM providers (optional, configure via env vars)
 anthropic>=0.40.0
 openai>=1.50.0
 
@@ -26,6 +26,9 @@ python-dotenv>=1.0.0
 # HTTP client — used by EvolutionClient and Sunbird language pipeline
 httpx>=0.27.0
 
+# PDF text extraction (replaces Gemini's native PDF support)
+pypdf>=4.0.0
+
 # Testing
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
@@ -33,3 +36,8 @@ pytest-asyncio>=0.23.0
 slowapi>=0.1.9
 sentry-sdk[fastapi]>=2.0.0
 prometheus-fastapi-instrumentator>=6.0.0
+
+# Optional: required only if you enable the legacy Gemini Live realtime voice
+# route (services/llm/gemini_live.py). Groq has no equivalent realtime voice API,
+# so this feature is preserved as-is and is NOT enabled by default.
+# google-genai>=1.0.0

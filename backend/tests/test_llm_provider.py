@@ -23,7 +23,7 @@ class FailProvider(LLMProvider):
 
 
 class QuotaProvider(LLMProvider):
-    """Simulates a quota error (same as Gemini 429)."""
+    """Simulates a quota error (HTTP 429 from any provider)."""
     name = "quota_provider"
     async def complete(self, prompt, system, max_tokens=500):
         raise RuntimeError("resource_exhausted: quota exceeded")
@@ -99,4 +99,4 @@ def test_get_provider_chain_returns_a_list():
     mod._cached_provider_chain = None
     chain = _get_provider_chain()
     assert isinstance(chain, list)
-    assert len(chain) >= 1  # At least the Gemini fallback is always added
+    assert len(chain) >= 1  # At least the Groq fallback is always added

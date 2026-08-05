@@ -54,15 +54,15 @@ async def generate_smart_confirmation(
 
     if confidence < 0.75:
         try:
-            gemini_text = await _gemini_clarification(data, confidence, original_text)
+            groq_text = await _groq_clarification(data, confidence, original_text)
         except Exception as exc:
-            logger.warning("gemini_clarification_failed", extra={"error": str(exc)})
-            gemini_text = (
+            logger.warning("groq_clarification_failed", extra={"error": str(exc)})
+            groq_text = (
                 "I wasn't completely sure about that. "
                 "Could you confirm the amount and person?"
             )
         return AssistantReply(
-            text=gemini_text,
+            text=groq_text,
             is_clarification=True,
             confidence=confidence,
         )
@@ -74,16 +74,22 @@ async def generate_smart_confirmation(
     )
 
 
-async def _gemini_clarification(
+async def _groq_clarification(
     data: dict,
     confidence: float,
     original_text: str,
 ) -> str:
-    """Use Gemini to generate a natural clarification question."""
-    from google import genai
-    from google.genai.types import GenerateContentConfig
+    """Use Groq to generate a natural clarification question."""
+    from openai import AsyncOpenAI
 
-    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY not set")
+    client = AsyncOpenAI(
+        api_key=api_key,
+        base_url="https://api.groq.com/openai/v1",
+    )
+    model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
     prompt = (
         f'The user sent: "{original_text}"\n'
         f"Extracted so far (confidence {confidence:.0%}): {json.dumps(data)}\n\n"
@@ -93,11 +99,17 @@ async def _gemini_clarification(
         "- Sounds like a helpful assistant, not a form\n"
         "Return ONLY the reply text."
     )
-    import asyncio as _asyncio
-    response = await _asyncio.to_thread(
-        client.models.generate_content,
-        model="gemini-2.0-flash",
-        contents=prompt,
-        config=GenerateContentConfig(max_output_tokens=100, temperature=0.3),
+    response = await client.chat.completions.create(
+        model=model,
+        max_tokens=100,
+        temperature=0.3,
+        messages=[
+            {"role": "system", "content": "You are a helpful WhatsApp business assistant."},
+            {"role": "user", "content": prompt},
+        ],
     )
-    return response.text.strip()
+    return (response.choices[0].message.content or "").strip()
+
+
+# Backward-compatible alias
+_gemini_clarification = _groq_clarification

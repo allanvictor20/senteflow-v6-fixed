@@ -1,11 +1,36 @@
+"""
+DEPRECATED — Gemini Live realtime voice/video API.
+==============================================
+
+This module wraps Google's Gemini Live API, which provides bidirectional
+realtime audio + video + text streaming. Groq has no equivalent realtime
+multimodal API, so this module has NOT been migrated to Groq and is preserved
+as-is for the legacy `/api/live` WebSocket route in `api/routes_legacy.py`.
+
+If you want to use this feature you MUST:
+  1. Install `google-genai` (commented out in requirements.txt).
+  2. Set the GEMINI_API_KEY environment variable.
+
+For everything else in SenteFlow (text/image/PDF/audio extraction, intent
+classification, clarifications, daily briefings), Groq is now used.
+"""
+
 import asyncio
 import inspect
 import logging
 import traceback
 
 logger = logging.getLogger(__name__)
-from google import genai
-from google.genai import types
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:  # pragma: no cover — only fails if google-genai isn't installed
+    genai = None
+    types = None
+    logger.warning(
+        "google_genai_not_installed — GeminiLive is unavailable. "
+        "Install google-genai and set GEMINI_API_KEY to enable the live voice route."
+    )
 
 class GeminiLive:
     """

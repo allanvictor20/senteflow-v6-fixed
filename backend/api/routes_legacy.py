@@ -27,7 +27,12 @@ from core.auth import verify_firebase_token, verify_org_access
 from core.errors import SenteFlowError, StructuredLogger, success_response
 from workflows.media_extraction_workflow import run_media_extraction
 from repositories.transaction_repository import TransactionRepository
-from services.llm.gemini_live import GeminiLive
+
+# NOTE: GeminiLive is intentionally NOT imported at module load time. It wraps
+# Google's Gemini Live realtime voice API (no Groq equivalent), so it requires
+# the optional `google-genai` package. Importing it eagerly would break app
+# startup for users who only want the Groq-backed features. The handler below
+# imports it lazily and returns a clear error if google-genai is missing.
 
 # ACTIVE_LIVE_VOICE removed — prompts moved to prompts/ module
 ACTIVE_LIVE_VOICE = "You are SenteFlow, an AI business assistant for small businesses in East Africa."
@@ -285,6 +290,34 @@ async def live_voice_endpoint(websocket: WebSocket):
     session_id = str(uuid.uuid4())[:8]
     logger.info("live_session_started", session_id=session_id)
 
+    # Lazy import so the app can run without the optional google-genai package.
+    try:
+        from services.llm.gemini_live import GeminiLive
+    except ImportError:
+        await websocket.send_json({
+            "type": "error",
+            "error": (
+                "Live voice is a legacy Gemini feature and requires the optional "
+                "`google-genai` package. Install it with: pip install google-genai. "
+                "Groq does not provide an equivalent realtime voice API."
+            ),
+        })
+        await websocket.close()
+        return
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        await websocket.send_json({
+            "type": "error",
+            "error": (
+                "GEMINI_API_KEY is not set. The live voice route still uses "
+                "Google's Gemini Live API (no Groq equivalent). Set GEMINI_API_KEY "
+                "to enable this feature, or use the rest of the app which now uses Groq."
+            ),
+        })
+        await websocket.close()
+        return
+
     audio_input_queue: asyncio.Queue = asyncio.Queue()
     video_input_queue: asyncio.Queue = asyncio.Queue()
     text_input_queue: asyncio.Queue = asyncio.Queue()
@@ -293,7 +326,7 @@ async def live_voice_endpoint(websocket: WebSocket):
         await websocket.send_bytes(data)
 
     gemini_client = GeminiLive(
-        api_key=os.environ.get("GEMINI_API_KEY"),
+        api_key=api_key,
         model=os.environ.get("LIVE_MODEL", "gemini-2.0-flash-live-001"),
         input_sample_rate=16000,
     )

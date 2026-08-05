@@ -43,7 +43,7 @@ export default function UploadView({ fileRef, uploading, onFileChange }) {
           <>
             <div className="spin" style={{ fontSize: 40, marginBottom: 12 }}>⟳</div>
             <p style={{ color: C.yellow, fontWeight: 700, fontSize: 16, margin: 0 }}>Extracting transactions…</p>
-            <p style={{ color: C.textMuted, fontSize: 13, marginTop: 6 }}>Gemini AI is processing your file</p>
+            <p style={{ color: C.textMuted, fontSize: 13, marginTop: 6 }}>Groq AI is processing your file</p>
           </>
         ) : (
           <>

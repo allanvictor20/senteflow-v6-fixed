@@ -2,7 +2,7 @@
 SenteFlow AI — Intent Detector
 ================================
 Classifies incoming text messages to determine what the user wants.
-Uses a fast keyword-first approach, falling back to Gemini for ambiguous cases.
+Uses a fast keyword-first approach, falling back to Groq for ambiguous cases.
 
 Intent categories:
   GREETING        — hello, hi, how are you
@@ -70,7 +70,7 @@ _PATTERNS: list[tuple[Intent, list[str]]] = [
 async def detect_intent(text: str) -> Intent:
     """
     Detect the intent of a text message.
-    Fast keyword matching first; Gemini fallback for ambiguous cases.
+    Fast keyword matching first; Groq fallback for ambiguous cases.
     """
     if not text or not text.strip():
         return Intent.UNKNOWN
@@ -84,43 +84,50 @@ async def detect_intent(text: str) -> Intent:
                 logger.debug("intent_keyword_match", extra={"intent": intent.value, "pattern": pattern})
                 return intent
 
-    # Fallback to Gemini for ambiguous messages
+    # Fallback to Groq for ambiguous messages
     try:
-        return await _gemini_intent_fallback(text)
+        return await _groq_intent_fallback(text)
     except Exception as e:
-        logger.warning("gemini_intent_fallback_failed", extra={"error": str(e)})
+        logger.warning("groq_intent_fallback_failed", extra={"error": str(e)})
         return Intent.UNKNOWN
 
 
-async def _gemini_intent_fallback(text: str) -> Intent:
-    """Use Gemini to classify intent when keyword matching fails."""
-    from google import genai
-    from google.genai.types import GenerateContentConfig
+# Backward-compatible alias
+_gemini_intent_fallback = None  # populated below
 
-    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
-    prompt = f"""Classify this WhatsApp message from a business user in Uganda.
-Return ONLY one of these labels (no explanation):
-- greeting
-- transaction  (recording a payment/expense/income)
-- payment      (someone paid something)
-- debt_query   (asking who owes money)
-- summary_request (asking for financial summary)
-- recent_request (asking for recent transactions)
-- help         (asking how to use the system)
-- unknown
+async def _groq_intent_fallback(text: str) -> Intent:
+    """Use Groq to classify intent when keyword matching fails."""
+    from openai import AsyncOpenAI
 
-Message: "{text}"
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY not set")
+    client = AsyncOpenAI(
+        api_key=api_key,
+        base_url="https://api.groq.com/openai/v1",
+    )
+    model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-Label:"""
+    system_prompt = (
+        "Classify WhatsApp messages from a business user in Uganda. "
+        "Return ONLY one of these labels (no explanation): "
+        "greeting, transaction, payment, debt_query, summary_request, "
+        "recent_request, help, unknown."
+    )
+    user_prompt = f'Message: "{text}"\nLabel:'
 
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=prompt,
-        config=GenerateContentConfig(max_output_tokens=20, temperature=0.1),
+    response = await client.chat.completions.create(
+        model=model,
+        max_tokens=20,
+        temperature=0.1,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
     )
 
-    raw = response.text.strip().lower()
+    raw = (response.choices[0].message.content or "").strip().lower()
     try:
         return Intent(raw)
     except ValueError:
@@ -129,3 +136,7 @@ Label:"""
             if intent.value in raw:
                 return intent
         return Intent.UNKNOWN
+
+
+# Backward-compatible alias for any caller that imported the old name
+_gemini_intent_fallback = _groq_intent_fallback

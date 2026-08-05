@@ -40,7 +40,7 @@ Incoming WhatsApp Message
           ↓
   ContextEngine.build()       ← load customer memory, open orders, history
           ↓
-  EventExtractor (Gemini)     ← classify into BusinessEvent
+  EventExtractor (Groq)       ← classify into BusinessEvent
           ↓
   UpdateMemoryWorkflow        ← persist what we learned
           ↓
@@ -76,7 +76,7 @@ backend/
 │   └── event_extraction_workflow.py  ← file upload → BusinessEvents
 │
 ├── services/             ← Pure capabilities (no orchestration)
-│   ├── llm/              ← All Gemini/AI calls
+│   ├── llm/              ← All Groq/AI calls
 │   │   ├── event_extractor.py     ← message → BusinessEvent (main LLM call)
 │   │   ├── language_pipeline.py   ← Luganda/Swahili normalisation
 │   │   ├── media_processor.py     ← audio transcription, image OCR
@@ -148,7 +148,10 @@ npm run dev
 ### Required environment variables
 
 ```
-GEMINI_API_KEY
+GROQ_API_KEY
+GROQ_MODEL                    # optional, defaults to llama-3.3-70b-versatile
+GROQ_VISION_MODEL             # optional, defaults to llama-3.2-90b-vision-preview
+GROQ_WHISPER_MODEL            # optional, defaults to whisper-large-v3
 WHATSAPP_VERIFY_TOKEN
 WHATSAPP_ACCESS_TOKEN
 EVOLUTION_API_URL
@@ -156,6 +159,16 @@ EVOLUTION_API_TOKEN
 EVOLUTION_INSTANCE_NAME
 GOOGLE_APPLICATION_CREDENTIALS
 DEFAULT_ORG_ID
+
+# Optional — only if you enable the legacy live voice WebSocket route
+GEMINI_API_KEY                # legacy Gemini Live realtime voice API (no Groq equivalent)
+```
+
+### Optional fallback LLM providers
+
+```
+ANTHROPIC_API_KEY             # Claude Haiku — used if Groq quota is exhausted
+OPENAI_API_KEY                # OpenAI gpt-4o-mini — last-resort fallback
 ```
 
 ---

@@ -4,12 +4,12 @@ SenteFlow AI — EventExtractor (v5)
 Two key upgrades:
 
 IDEA 06 — Multi-Provider LLM Abstraction (P1):
-  _call_llm() now uses complete_with_fallback() instead of hardcoded Gemini.
-  Chain: Gemini → Claude → OpenAI. Owner sees no disruption if Gemini quota hits.
+  _call_llm() now uses complete_with_fallback() instead of a hardcoded provider.
+  Chain: Groq → Claude → OpenAI. Owner sees no disruption if Groq quota hits.
 
 IDEA 08 — Business Profile Memory (P1):
   build_system_prompt() injects per-org BusinessProfile into every LLM call.
-  Gemini now knows THIS business's products, credit policy, and "the usual".
+  Groq now knows THIS business's products, credit policy, and "the usual".
 
 All v4 fixes retained:
   - Amount coercion (_parse_amount, _coerce_entities)
@@ -252,8 +252,8 @@ async def _call_llm(
     profile_repo=None,
 ) -> dict[str, Any]:
     """
-    IDEA 06: Call LLM with fallback chain instead of hardcoded Gemini.
-    Uses complete_with_fallback() → Gemini → Claude → OpenAI.
+    IDEA 06: Call LLM with fallback chain instead of a hardcoded provider.
+    Uses complete_with_fallback() → Groq → Claude → OpenAI.
     """
     from services.llm.llm_provider import complete_with_fallback
 
@@ -276,7 +276,7 @@ async def _call_llm(
         max_tokens=500,
     )
 
-    if provider_used != "gemini":
+    if provider_used != "groq":
         logger.info("extraction_used_fallback_provider", extra={"provider": provider_used})
 
     # Strip accidental markdown fences

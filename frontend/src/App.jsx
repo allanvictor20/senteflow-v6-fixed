@@ -412,7 +412,7 @@ function SettingsView() {
         </div>
         <div style={{ ...rowStyle, borderBottom: "none", paddingBottom: 0, marginTop: 12 }}>
           <span style={{ color: C.textMuted, fontSize: 13 }}>AI providers</span>
-          <span style={{ color: C.textDim, fontSize: 13 }}>Gemini → Claude → GPT-4o-mini</span>
+          <span style={{ color: C.textDim, fontSize: 13 }}>Groq → Claude → GPT-4o-mini</span>
         </div>
       </div>
 

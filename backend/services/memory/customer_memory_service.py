@@ -29,9 +29,18 @@ _SUMMARY_REFRESH_HOURS = 24
 
 class CustomerMemoryService:
 
-    def __init__(self, profile_repo, gemini_client=None):
+    def __init__(self, profile_repo, llm_client=None, gemini_client=None):
+        """
+        Args:
+            profile_repo: CustomerProfileRepository instance.
+            llm_client: optional async callable with a .generate(prompt, max_tokens=...)
+                method. Used to refresh ai_summary on customer profiles. If not
+                provided, summaries are skipped.
+            gemini_client: DEPRECATED alias for llm_client (kept for backward
+                compatibility — SenteFlow now uses Groq as the primary LLM).
+        """
         self._repo = profile_repo
-        self._gemini = gemini_client
+        self._llm = llm_client or gemini_client
 
     def apply_event(
         self,
@@ -76,12 +85,12 @@ class CustomerMemoryService:
             except Exception:
                 pass
 
-        if not self._gemini:
+        if not self._llm:
             return None
 
         prompt = _build_summary_prompt(profile)
         try:
-            summary = await self._gemini.generate(prompt, max_tokens=200)
+            summary = await self._llm.generate(prompt, max_tokens=200)
             self._repo.update_ai_summary(org_id, profile_id, summary)
             return summary
         except Exception as exc:

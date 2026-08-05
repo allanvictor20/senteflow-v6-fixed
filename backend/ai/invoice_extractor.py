@@ -1,19 +1,26 @@
 """
-SenteFlow AI — Invoice Extraction Module
-=========================================
+SenteFlow AI — Invoice Extraction Module (Groq edition)
+=========================================================
 Dedicated AI extraction for invoice images (supplier invoices, receipts,
 mobile money screenshots, utility bills). Separate from the general SME
 extractor because invoice structure differs significantly from voice/text records.
+
+Groq migration notes:
+  - Uses Groq's vision model (default: llama-3.2-90b-vision-preview).
+  - Switched from Gemini's `response_schema=Pydantic` to JSON mode
+    (`response_format={"type": "json_object"}`) + Pydantic parsing.
+  - The InvoiceData schema description is embedded into the prompt.
 """
 
+import base64
+import json
 import logging
 
 import os
 from typing import Optional
 
+from openai import OpenAI
 from pydantic import BaseModel, Field
-from google import genai
-from google.genai.types import GenerateContentConfig, Part
 from utils.clock import utc_now
 
 # ACTIVE_INVOICE_EXTRACTION removed — define inline or in prompts/ module
@@ -21,8 +28,22 @@ ACTIVE_INVOICE_EXTRACTION = "Extract invoice details from the following text."
 
 logger = logging.getLogger(__name__)
 
-_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-MODEL_ID = "gemini-2.0-flash"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+DEFAULT_GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "llama-3.2-90b-vision-preview")
+MODEL_ID = DEFAULT_GROQ_VISION_MODEL
+
+# The client is built on first use — same pattern as ai/extractor.py
+_client_instance: Optional[OpenAI] = None
+
+
+def _client() -> OpenAI:
+    global _client_instance
+    if _client_instance is None:
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            raise RuntimeError("GROQ_API_KEY is not set — cannot run invoice extraction")
+        _client_instance = OpenAI(api_key=api_key, base_url=GROQ_BASE_URL)
+    return _client_instance
 
 
 # ─── Invoice Schemas ──────────────────────────────────────────────────────────
@@ -61,6 +82,45 @@ class InvoiceData(BaseModel):
     confidence: str = Field("high")
 
 
+# Schema hint embedded into the system prompt — Groq does not support
+# Gemini-style `response_schema=Pydantic`, so we describe the JSON shape
+# explicitly and parse the model's JSON-mode output with Pydantic.
+_INVOICE_SCHEMA_HINT = """
+Return a JSON object with EXACTLY this shape:
+{
+  "invoice_number": null,
+  "invoice_date": null,
+  "due_date": null,
+  "vendor_name": null,
+  "vendor_address": null,
+  "vendor_phone": null,
+  "vendor_tax_id": null,
+  "buyer_name": null,
+  "buyer_address": null,
+  "currency": "UGX",
+  "subtotal": null,
+  "tax_amount": null,
+  "tax_rate": null,
+  "discount": null,
+  "total_amount": 0.0,
+  "payment_method": null,
+  "payment_status": null,
+  "mobile_money_ref": null,
+  "line_items": [
+    {"description": "", "quantity": null, "unit_price": null, "total": null, "unit": null}
+  ],
+  "invoice_type": "supplier_invoice",
+  "language_detected": "en",
+  "notes": null,
+  "confidence": "high"
+}
+- Use null for any field that cannot be determined.
+- `total_amount` is required.
+- `line_items` may be an empty array if no individual lines are visible.
+- Only return valid JSON. No markdown fences. No commentary outside the JSON.
+"""
+
+
 # ─── Invoice Extractor ────────────────────────────────────────────────────────
 
 def extract_invoice(
@@ -72,7 +132,9 @@ def extract_invoice(
     Extract structured invoice data from an image.
     Returns a fully structured InvoiceData object.
     """
-    image_part = Part.from_bytes(data=image_bytes, mime_type=mime_type)
+    client = _client()
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    data_url = f"data:{mime_type};base64,{b64}"
 
     base_instruction = (
         "Extract ALL structured invoice data from this image. "
@@ -81,23 +143,43 @@ def extract_invoice(
     if custom_prompt:
         base_instruction += f"\n\nAdditional focus: {custom_prompt}"
 
-    response = _client.models.generate_content(
-        model=MODEL_ID,
-        contents=[base_instruction, image_part],
-        config=GenerateContentConfig(
-            system_instruction=ACTIVE_INVOICE_EXTRACTION,
-            response_schema=InvoiceData,
-            response_mime_type="application/json",
-            temperature=0.0,
-        ),
+    response = client.chat.completions.create(
+        model=DEFAULT_GROQ_VISION_MODEL,
+        temperature=0.0,
+        max_tokens=2500,
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": ACTIVE_INVOICE_EXTRACTION + "\n\n" + _INVOICE_SCHEMA_HINT,
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": base_instruction},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
     )
 
+    raw = (response.choices[0].message.content or "").strip()
+    if raw.startswith("```"):
+        parts = raw.split("```")
+        if len(parts) >= 2:
+            raw = parts[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        raw = raw.strip()
+
+    parsed = InvoiceData.model_validate_json(raw)
+
     logger.info(
-        f"Invoice extracted: {response.parsed.vendor_name} | "
-        f"{response.parsed.total_amount} {response.parsed.currency} | "
-        f"lang={response.parsed.language_detected}"
+        f"Invoice extracted: {parsed.vendor_name} | "
+        f"{parsed.total_amount} {parsed.currency} | "
+        f"lang={parsed.language_detected}"
     )
-    return response.parsed
+    return parsed
 
 
 # ─── Invoice → Transactions Converter ────────────────────────────────────────

@@ -120,7 +120,7 @@ def _fast_classify(text: str, input_type: str):
     return None
 
 
-_GEMINI_SYSTEM = (
+_GROQ_SYSTEM = (
     "You are an intent classifier for a WhatsApp business assistant used by SME owners.\n"
     "Classify the message into exactly one of these intents:\n"
     "customer_question, order_request, negotiation, product_availability, complaint,\n"
@@ -132,19 +132,33 @@ _GEMINI_SYSTEM = (
 )
 
 
-async def _gemini_classify(text: str, input_type: str) -> IntentResult:
-    try:
-        from google import genai
-        from google.genai.types import GenerateContentConfig
+def _groq_client():
+    """Build an async Groq-compatible OpenAI client."""
+    from openai import AsyncOpenAI
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY not set")
+    return AsyncOpenAI(
+        api_key=api_key,
+        base_url="https://api.groq.com/openai/v1",
+    )
 
-        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-        prompt = f'{_GEMINI_SYSTEM}\n\nMessage: "{text}"\nInput type: {input_type}'
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt,
-            config=GenerateContentConfig(max_output_tokens=150, temperature=0.0),
+
+async def _groq_classify(text: str, input_type: str) -> IntentResult:
+    try:
+        client = _groq_client()
+        model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+        user_prompt = f'Message: "{text}"\nInput type: {input_type}'
+        response = await client.chat.completions.create(
+            model=model,
+            max_tokens=150,
+            temperature=0.0,
+            messages=[
+                {"role": "system", "content": _GROQ_SYSTEM},
+                {"role": "user", "content": user_prompt},
+            ],
         )
-        raw = response.text.strip()
+        raw = (response.choices[0].message.content or "").strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -157,18 +171,22 @@ async def _gemini_classify(text: str, input_type: str) -> IntentResult:
         return IntentResult(
             intent=intent,
             confidence=float(data.get("confidence", 0.5)),
-            reason=data.get("reason", "Gemini classification"),
+            reason=data.get("reason", "Groq classification"),
         )
     except Exception as exc:
-        logger.warning("gemini_intent_classify_failed", extra={"error": str(exc), "text": text[:60]})
-        return IntentResult(intent=Intent.UNKNOWN, confidence=0.3, reason=f"Gemini failed: {exc}")
+        logger.warning("groq_intent_classify_failed", extra={"error": str(exc), "text": text[:60]})
+        return IntentResult(intent=Intent.UNKNOWN, confidence=0.3, reason=f"Groq failed: {exc}")
+
+
+# Backward-compatible alias
+_gemini_classify = _groq_classify
 
 
 async def classify_intent_async(text: str = "", input_type: str = "text") -> IntentResult:
     fast = _fast_classify(text, input_type)
     if fast is not None and fast.confidence >= 0.85:
         return fast
-    return await _gemini_classify(text, input_type)
+    return await _groq_classify(text, input_type)
 
 
 def classify_intent(text: str = "", input_type: str = "text") -> IntentResult:

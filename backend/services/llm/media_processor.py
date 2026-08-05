@@ -171,14 +171,20 @@ async def transcribe_audio(
     wa_client=None,
 ) -> str:
     """
-    Transcribe audio from a media URL using Gemini.
+    Transcribe audio from a media URL using Groq Whisper (whisper-large-v3).
     Returns transcript text or empty string on failure.
+
+    Groq does not extract structured events from audio in a single call the way
+    Gemini does — we transcribe here, and the caller (or ai/extractor.py) is
+    responsible for running event extraction over the resulting transcript if
+    needed.
 
     FIX (v2): uses download_and_save_media retry logic when wa_client is provided,
     falling back to httpx for direct URLs (e.g. tests).
     """
     import os
     import httpx
+    from io import BytesIO
 
     try:
         if wa_client is not None:
@@ -196,21 +202,32 @@ async def transcribe_audio(
                 resp.raise_for_status()
                 audio_bytes = resp.content
 
-        from google import genai
-        from google.genai.types import GenerateContentConfig, Part
+        from openai import AsyncOpenAI
 
-        gc = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-        audio_part = Part.from_bytes(data=audio_bytes, mime_type=mime_type or "audio/ogg")
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            logger.warning("transcribe_audio_no_groq_key")
+            return ""
 
-        response = gc.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=[
-                "Transcribe this voice note completely. The speaker may use Luganda, Swahili, English or a mix.",
-                audio_part,
-            ],
-            config=GenerateContentConfig(max_output_tokens=500, temperature=0.0),
+        client = AsyncOpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+        whisper_model = os.environ.get("GROQ_WHISPER_MODEL", "whisper-large-v3")
+
+        # Groq Whisper requires a filename with a recognisable extension
+        ext_map = {
+            "audio/ogg": ".ogg",
+            "audio/mpeg": ".mp3",
+            "audio/mp4": ".m4a",
+            "audio/wav": ".wav",
+        }
+        filename = f"voice_note{ext_map.get(mime_type, '.ogg')}"
+
+        response = await client.audio.transcriptions.create(
+            model=whisper_model,
+            file=(filename, BytesIO(audio_bytes), mime_type or "audio/ogg"),
+            response_format="text",
+            language=None,  # auto-detect (Luganda/Swahili/English mix)
         )
-        return response.text.strip()
+        return (response or "").strip()
     except Exception as exc:
         logging.getLogger(__name__).warning("transcribe_audio_failed", extra={"error": str(exc)})
         return ""

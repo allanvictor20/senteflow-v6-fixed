@@ -1,11 +1,16 @@
 """
-SenteFlow — Multi-Provider LLM Abstraction (IDEA 06)
-=====================================================
-Prevents SenteFlow from going offline when Gemini quota is exhausted.
+SenteFlow — Multi-Provider LLM Abstraction (IDEA 06, Groq edition)
+===================================================================
+Prevents SenteFlow from going offline when the primary LLM provider is
+unavailable or rate-limited.
 
-Provider chain: Gemini → Claude Haiku → OpenAI gpt-4o-mini
+Provider chain: Groq → Claude Haiku → OpenAI gpt-4o-mini
 Each provider implements LLMProvider.complete(). On quota/rate errors,
 the next provider is tried silently. Owner sees no disruption.
+
+Groq is OpenAI-compatible, so the GroqProvider uses the `openai` SDK
+pointed at https://api.groq.com/openai/v1. Default model:
+`llama-3.3-70b-versatile`. Override with the GROQ_MODEL env var.
 
 Usage:
     from services.llm.llm_provider import complete_with_fallback
@@ -18,6 +23,10 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Default Groq model. Override with the GROQ_MODEL env var.
+DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 
 class LLMProvider(ABC):
@@ -32,29 +41,33 @@ class LLMProvider(ABC):
         return any(k in msg for k in ("quota", "rate", "limit", "429", "exhausted", "resource_exhausted"))
 
 
-class GeminiProvider(LLMProvider):
-    name = "gemini"
+class GroqProvider(LLMProvider):
+    """
+    Primary provider. Uses Groq's OpenAI-compatible endpoint via the `openai`
+    SDK (already in requirements). Default model: llama-3.3-70b-versatile.
+    """
+
+    name = "groq"
 
     async def complete(self, prompt: str, system: str, max_tokens: int = 500) -> str:
-        import asyncio
-        from google import genai
-        from google.genai.types import GenerateContentConfig
+        from openai import AsyncOpenAI
 
-        api_key = os.environ.get("GEMINI_API_KEY")
+        api_key = os.environ.get("GROQ_API_KEY")
         if not api_key:
-            raise ValueError("GEMINI_API_KEY not set")
+            raise ValueError("GROQ_API_KEY not set")
 
-        client = genai.Client(api_key=api_key)
-        response = await asyncio.to_thread(
-            client.models.generate_content,
-            model="gemini-2.0-flash",
-            contents=f"{system}\n\n{prompt}",
-            config=GenerateContentConfig(
-                max_output_tokens=max_tokens,
-                temperature=0.1,
-            ),
+        model = os.environ.get("GROQ_MODEL", DEFAULT_GROQ_MODEL)
+        client = AsyncOpenAI(api_key=api_key, base_url=GROQ_BASE_URL)
+        response = await client.chat.completions.create(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=0.1,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
         )
-        return response.text.strip()
+        return (response.choices[0].message.content or "").strip()
 
 
 class ClaudeProvider(LLMProvider):
@@ -111,8 +124,8 @@ class AllProvidersExhausted(Exception):
 _cached_provider_chain: list[LLMProvider] | None = None
 
 # Provider order matters: cheapest/fastest first, then fallbacks.
-_PROVIDER_SPECS: list[tuple[str, type[LLMProvider]]] = [
-    ("GEMINI_API_KEY", GeminiProvider),
+_PROVIDERSPECS: list[tuple[str, type[LLMProvider]]] = [
+    ("GROQ_API_KEY", GroqProvider),
     ("ANTHROPIC_API_KEY", ClaudeProvider),
     ("OPENAI_API_KEY", OpenAIProvider),
 ]
@@ -124,16 +137,16 @@ def _build_provider_chain() -> list[LLMProvider]:
     environment. Providers without a configured key are skipped rather than
     added-and-failed, so the first entry is always a usable provider.
     """
-    chain = [cls() for env_var, cls in _PROVIDER_SPECS if os.environ.get(env_var)]
+    chain = [cls() for env_var, cls in _PROVIDERSPECS if os.environ.get(env_var)]
     if not chain:
         # Never return an empty chain: callers expect at least one provider, and
-        # attempting the primary yields a precise "GEMINI_API_KEY not set" error
+        # attempting the primary yields a precise "GROQ_API_KEY not set" error
         # rather than a vague "nothing configured".
         logger.error(
             "no_llm_providers_configured",
-            extra={"checked": [name for name, _ in _PROVIDER_SPECS]},
+            extra={"checked": [name for name, _ in _PROVIDERSPECS]},
         )
-        return [GeminiProvider()]
+        return [GroqProvider()]
     logger.info("llm_provider_chain_built", extra={"providers": [p.name for p in chain]})
     return chain
 
@@ -180,14 +193,14 @@ async def complete_with_fallback(
     if not chain:
         raise AllProvidersExhausted(
             "No LLM provider is configured. Set at least one of "
-            "GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY."
+            "GROQ_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY."
         )
     last_exc: Exception | None = None
 
     for provider in chain:
         try:
             text = await provider.complete(prompt, system, max_tokens=max_tokens)
-            if provider.name != (chain[0].name if chain else "gemini"):
+            if provider.name != (chain[0].name if chain else "groq"):
                 logger.warning(
                     "llm_fallback_used",
                     extra={"provider": provider.name, "reason": str(last_exc)[:80]},
