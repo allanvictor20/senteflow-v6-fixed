@@ -1,18 +1,26 @@
 """
-DEPRECATED — Gemini Live realtime voice/video API.
-==============================================
+DEPRECATED — Legacy Gemini Live realtime voice/video API (NOT RECOMMENDED).
+=========================================================================
 
 This module wraps Google's Gemini Live API, which provides bidirectional
-realtime audio + video + text streaming. Groq has no equivalent realtime
-multimodal API, so this module has NOT been migrated to Groq and is preserved
-as-is for the legacy `/api/live` WebSocket route in `api/routes_legacy.py`.
+realtime audio + video + text streaming. It was the original implementation
+of SenteFlow's live-voice feature.
 
-If you want to use this feature you MUST:
+AS OF v6.1, THIS MODULE IS NO LONGER REACHED FROM ANY ACTIVE ROUTE.
+The `/ws/live` WebSocket in `api/routes_legacy.py` returns a deprecation
+notice. Voice interaction now happens via WhatsApp voice notes:
+
+  - Inbound voice notes are transcribed by Deepgram nova-2
+    (services/llm/media_processor.py)
+  - Long voice memos are segmented by Silero VAD
+    (services/llm/media_processor.py → segment_voice_memo)
+  - Replies to voice notes are synthesized by ElevenLabs
+    (integrations/whatsapp/reply_sender.py → send_voice_aware)
+
+This file is PRESERVED for reference. To re-enable the legacy Gemini path:
   1. Install `google-genai` (commented out in requirements.txt).
   2. Set the GEMINI_API_KEY environment variable.
-
-For everything else in SenteFlow (text/image/PDF/audio extraction, intent
-classification, clarifications, daily briefings), Groq is now used.
+  3. Restore the old `/ws/live` handler from git history.
 """
 
 import asyncio

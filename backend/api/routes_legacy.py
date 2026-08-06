@@ -28,14 +28,12 @@ from core.errors import SenteFlowError, StructuredLogger, success_response
 from workflows.media_extraction_workflow import run_media_extraction
 from repositories.transaction_repository import TransactionRepository
 
-# NOTE: GeminiLive is intentionally NOT imported at module load time. It wraps
-# Google's Gemini Live realtime voice API (no Groq equivalent), so it requires
-# the optional `google-genai` package. Importing it eagerly would break app
-# startup for users who only want the Groq-backed features. The handler below
-# imports it lazily and returns a clear error if google-genai is missing.
-
-# ACTIVE_LIVE_VOICE removed — prompts moved to prompts/ module
-ACTIVE_LIVE_VOICE = "You are SenteFlow, an AI business assistant for small businesses in East Africa."
+# NOTE: The legacy /ws/live WebSocket route (which used Google's Gemini Live
+# realtime voice API) has been removed. Live voice chat is not currently
+# exposed as a separate feature — voice interaction happens via WhatsApp
+# voice notes (transcribed by Deepgram, replies synthesized by ElevenLabs).
+# The old GeminiLive module (services/llm/gemini_live.py) is preserved as
+# legacy reference but is no longer reachable from any active route.
 
 logger = StructuredLogger(__name__)
 
@@ -282,102 +280,23 @@ async def get_transaction_evidence(org_id: str, transaction_id: str, _: dict = D
     })
 
 
-# ─── Gemini Live WebSocket ────────────────────────────────────────────────────
+# ─── Legacy live voice WebSocket (deprecated) ─────────────────────────────────
 
 @live_router.websocket("/ws/live")
-async def live_voice_endpoint(websocket: WebSocket):
+async def legacy_live_voice_endpoint(websocket: WebSocket):
+    """Deprecated — the legacy Gemini Live WebSocket has been removed.
+
+    Returns a single error message and closes. Voice interaction now happens
+    via WhatsApp voice notes: the bot transcribes inbound notes with Deepgram
+    and replies with synthesized voice notes via ElevenLabs.
+    """
     await websocket.accept()
-    session_id = str(uuid.uuid4())[:8]
-    logger.info("live_session_started", session_id=session_id)
-
-    # Lazy import so the app can run without the optional google-genai package.
-    try:
-        from services.llm.gemini_live import GeminiLive
-    except ImportError:
-        await websocket.send_json({
-            "type": "error",
-            "error": (
-                "Live voice is a legacy Gemini feature and requires the optional "
-                "`google-genai` package. Install it with: pip install google-genai. "
-                "Groq does not provide an equivalent realtime voice API."
-            ),
-        })
-        await websocket.close()
-        return
-
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        await websocket.send_json({
-            "type": "error",
-            "error": (
-                "GEMINI_API_KEY is not set. The live voice route still uses "
-                "Google's Gemini Live API (no Groq equivalent). Set GEMINI_API_KEY "
-                "to enable this feature, or use the rest of the app which now uses Groq."
-            ),
-        })
-        await websocket.close()
-        return
-
-    audio_input_queue: asyncio.Queue = asyncio.Queue()
-    video_input_queue: asyncio.Queue = asyncio.Queue()
-    text_input_queue: asyncio.Queue = asyncio.Queue()
-
-    async def audio_output_callback(data: bytes):
-        await websocket.send_bytes(data)
-
-    gemini_client = GeminiLive(
-        api_key=api_key,
-        model=os.environ.get("LIVE_MODEL", "gemini-2.0-flash-live-001"),
-        input_sample_rate=16000,
-    )
-    gemini_client._system_prompt = ACTIVE_LIVE_VOICE
-
-    async def receive_from_client():
-        try:
-            while True:
-                message = await websocket.receive()
-                if message.get("bytes"):
-                    await audio_input_queue.put(message["bytes"])
-                elif message.get("text"):
-                    try:
-                        payload = json.loads(message["text"])
-                        if isinstance(payload, dict):
-                            if payload.get("type") == "image":
-                                await video_input_queue.put(base64.b64decode(payload["data"]))
-                                continue
-                            elif payload.get("type") == "stop":
-                                break
-                            elif payload.get("type") == "text":
-                                await text_input_queue.put(payload.get("text", ""))
-                                continue
-                    except json.JSONDecodeError:
-                        pass
-                    await text_input_queue.put(message["text"])
-        except WebSocketDisconnect:
-            logger.info("live_client_disconnected", session_id=session_id)
-        except Exception as e:
-            logger.error("live_receive_error", exc=e, session_id=session_id)
-
-    receive_task = asyncio.create_task(receive_from_client())
-    try:
-        async for event in gemini_client.start_session(
-            audio_input_queue=audio_input_queue,
-            video_input_queue=video_input_queue,
-            text_input_queue=text_input_queue,
-            audio_output_callback=audio_output_callback,
-        ):
-            if event:
-                await websocket.send_json(event)
-    except Exception as e:
-        logger.error("live_session_error", exc=e, session_id=session_id)
-        try:
-            await websocket.send_json({"type": "error", "error": str(e)})
-        except Exception:
-            pass
-    finally:
-        receive_task.cancel()
-        try:
-            await websocket.close()
-        except Exception:
-            pass
-        logger.info("live_session_closed", session_id=session_id)
+    await websocket.send_json({
+        "type": "deprecated",
+        "error": (
+            "The /ws/live Gemini Live WebSocket has been removed. "
+            "Voice interaction now happens via WhatsApp voice notes. "
+            "See README.md > Voice Notes."
+        ),
+    })
+    await websocket.close()

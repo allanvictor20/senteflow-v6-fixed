@@ -9,6 +9,16 @@ Storage layout:
   backend/storage/voice_notes/  — audio, voice notes
   backend/storage/uploads/      — other media
 
+Voice note pipeline (v6.1):
+  - Deepgram nova-2 STT replaces Groq Whisper for primary transcription.
+    Deepgram has dedicated Swahili support, auto-detects language (Sheng
+    code-switching), and adds punctuation/capitalization. Falls back to
+    Groq Whisper if DEEPGRAM_API_KEY is not set.
+  - Silero VAD segments long voice memos (>30s) into separate utterances.
+    Each segment is transcribed independently — a single 3-minute recap
+    voice note can produce multiple distinct business events instead of
+    one merged event.
+
 FIX (v2): Robust media download.
   - download_and_save_media now raises MediaDownloadError on failure instead
     of silently returning None. Callers can catch this and send a specific
@@ -18,17 +28,17 @@ FIX (v2): Robust media download.
     background task runs if the queue was busy.
   - Added explicit logging of HTTP status codes on failure so you know
     whether it's a 401 (auth), 403 (expired), 404 (not found), or timeout.
-  - transcribe_audio unchanged except it also raises on empty bytes so
-    VoiceInterpreter gets a clear signal.
 """
 
 import asyncio
+import io
 import logging
 import mimetypes
 import os
 import uuid
 
 
+from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -69,10 +79,36 @@ _MIME_TO_EXT = {
 _DOWNLOAD_RETRIES = 2
 _RETRY_DELAY_SECONDS = 3
 
+# Voice notes longer than this threshold (in seconds) go through the Silero
+# VAD segmentation path. Shorter notes are transcribed in a single Deepgram
+# call. 30s is roughly the length of a short conversational turn — anything
+# longer likely contains multiple distinct utterances worth extracting
+# separately.
+_LONG_AUDIO_THRESHOLD_SECONDS = 30.0
+
+# Minimum segment duration to keep. Silero occasionally emits tiny segments
+# (<0.5s) that are just audio artifacts — not real speech. Filter them out.
+_MIN_SEGMENT_DURATION_SECONDS = 0.5
+
 
 class MediaDownloadError(Exception):
     """Raised when media cannot be downloaded after all retries."""
     pass
+
+
+@dataclass
+class VoiceSegment:
+    """A single speech segment extracted from a longer voice memo.
+
+    `start_ms` / `end_ms` are wallclock offsets within the original audio.
+    `audio_bytes` is a self-contained WAV (16kHz, 16-bit, mono) ready to
+    hand to Deepgram. `transcript` is filled in by `transcribe_segments`.
+    """
+
+    start_ms: int
+    end_ms: int
+    audio_bytes: bytes
+    transcript: str = ""
 
 
 async def download_and_save_media(
@@ -165,30 +201,274 @@ async def download_and_save_media(
     )
 
 
+# ── Audio decoding & VAD ──────────────────────────────────────────────────────
+
+
+def _decode_to_pcm_16k_mono(audio_bytes: bytes, mime_type: Optional[str]) -> tuple:
+    """
+    Decode any audio format WhatsApp might send (ogg, m4a, mp3, wav) into
+    16kHz mono 32-bit float numpy array — the format Silero VAD expects.
+
+    Returns (samples, sample_rate). Raises on decode failure.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    # soundfile reads from a file-like object; it auto-detects format from
+    # the file header for ogg/m4a/mp3/wav on most systems (libsndfile 1.1+).
+    # If the format isn't supported, we get an exception — caller falls back.
+    buf = io.BytesIO(audio_bytes)
+    samples, sr = sf.read(buf, dtype="float32", always_2d=False)
+
+    # Mono: average channels if stereo
+    if samples.ndim > 1:
+        samples = samples.mean(axis=1)
+
+    # Resample to 16kHz if needed — Silero VAD is trained on 16kHz.
+    if sr != 16000:
+        try:
+            import librosa
+            samples = librosa.resample(samples, orig_sr=sr, target_sr=16000)
+            sr = 16000
+        except ImportError:
+            # librosa not available — naive linear resample as a fallback.
+            # Good enough for VAD boundary detection (not for transcription).
+            ratio = 16000 / sr
+            indices = np.arange(0, len(samples), ratio).astype(np.int64)
+            samples = samples[indices]
+            sr = 16000
+
+    return samples, sr
+
+
+def _segment_with_silero(samples, sample_rate: int) -> list[VoiceSegment]:
+    """
+    Run Silero VAD over the decoded audio, return a list of VoiceSegments
+    (each containing its own WAV-encoded bytes ready for Deepgram).
+    """
+    from silero_vad import load_silero_vad, get_speech_timestamps
+    import torch
+    import soundfile as sf
+
+    model = load_silero_vad()
+    # Silero expects a torch tensor
+    wav_tensor = torch.from_numpy(samples).unsqueeze(0)
+
+    # get_speech_timestamps returns a list of {"start": sample_idx, "end": sample_idx}
+    # in sample positions within the input tensor.
+    speech_ts = get_speech_timestamps(
+        wav_tensor,
+        model,
+        sampling_rate=sample_rate,
+        return_seconds=False,
+        threshold=0.5,
+        min_speech_duration_ms=250,
+        min_silence_duration_ms=300,
+        speech_pad_ms=200,
+    )
+
+    segments: list[VoiceSegment] = []
+    for ts in speech_ts:
+        start_sample = ts["start"]
+        end_sample = ts["end"]
+        duration_s = (end_sample - start_sample) / sample_rate
+        if duration_s < _MIN_SEGMENT_DURATION_SECONDS:
+            continue
+
+        # Slice the segment from the original samples
+        seg_samples = samples[start_sample:end_sample]
+
+        # Encode as 16-bit PCM WAV in memory — Deepgram accepts WAV bytes.
+        buf = io.BytesIO()
+        sf.write(buf, seg_samples, sample_rate, format="WAV", subtype="PCM_16")
+        seg_bytes = buf.getvalue()
+
+        segments.append(VoiceSegment(
+            start_ms=int(start_sample * 1000 / sample_rate),
+            end_ms=int(end_sample * 1000 / sample_rate),
+            audio_bytes=seg_bytes,
+        ))
+
+    return segments
+
+
+def segment_voice_memo(audio_bytes: bytes, mime_type: Optional[str]) -> list[VoiceSegment]:
+    """
+    High-level: decode + run Silero VAD + return list of speech segments.
+
+    Used by ai/extractor.py for long voice memos: each segment is transcribed
+    independently so the LLM extractor sees one utterance at a time, producing
+    multiple distinct BusinessEvents from a single voice memo.
+
+    Returns an empty list if VAD couldn't find any speech (e.g. silent file,
+    or audio format couldn't be decoded). Callers should fall back to the
+    single-pass transcription path in that case.
+    """
+    try:
+        samples, sr = _decode_to_pcm_16k_mono(audio_bytes, mime_type)
+    except Exception as exc:
+        logger.warning("voice_memo_decode_failed", extra={"error": str(exc), "mime": mime_type})
+        return []
+
+    try:
+        segments = _segment_with_silero(samples, sr)
+    except Exception as exc:
+        logger.warning("voice_memo_vad_failed", extra={"error": str(exc)})
+        return []
+
+    logger.info(
+        "voice_memo_segmented",
+        extra={
+            "segment_count": len(segments),
+            "total_duration_s": round(len(samples) / sr, 1),
+        },
+    )
+    return segments
+
+
+# ── Transcription (Deepgram primary, Groq Whisper fallback) ───────────────────
+
+
+async def _transcribe_with_deepgram(audio_bytes: bytes, mime_type: Optional[str]) -> str:
+    """
+    Send the audio bytes to Deepgram's nova-2 model with auto-language detection.
+    Returns the transcript text. Raises on failure.
+    """
+    import os
+    from deepgram import DeepgramClient, PrerecordedOptions, FileSource
+
+    api_key = os.environ.get("DEEPGRAM_API_KEY")
+    if not api_key:
+        raise RuntimeError("DEEPGRAM_API_KEY not set")
+
+    client = DeepgramClient(api_key)
+
+    payload: FileSource = {"buffer": audio_bytes}
+    options = PrerecordedOptions(
+        model="nova-2",
+        # "multi" enables auto-language detection — critical for Sheng
+        # (Swahili/English code-switching) which is common in East Africa.
+        language="multi",
+        smart_format=True,        # add punctuation + capitalization
+        detect_language=True,
+        punctuate=True,
+        utterances=False,         # we use Silero for segmentation, not Deepgram
+    )
+
+    response = await client.listen.asyncprerecorded.v("1").transcribe_file(payload, options)
+
+    # Deepgram returns a channel/alternative structure. Take the first
+    # alternative of the first channel — that's the full transcript.
+    try:
+        channels = response.results.channels
+        if channels and channels[0].alternatives:
+            return (channels[0].alternatives[0].transcript or "").strip()
+    except (AttributeError, IndexError):
+        pass
+
+    # Fallback: try the dict shape (older SDK versions return dicts)
+    try:
+        return (response["results"]["channels"][0]["alternatives"][0]["transcript"] or "").strip()
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+async def _transcribe_with_groq_whisper(audio_bytes: bytes, mime_type: Optional[str]) -> str:
+    """
+    Fallback: transcribe with Groq Whisper (whisper-large-v3).
+    Lower accuracy on Swahili/Luganda than Deepgram but works without
+    a Deepgram API key.
+    """
+    import os
+    from io import BytesIO
+    from openai import AsyncOpenAI
+
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY not set")
+
+    client = AsyncOpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+    whisper_model = os.environ.get("GROQ_WHISPER_MODEL", "whisper-large-v3")
+
+    ext_map = {
+        "audio/ogg": ".ogg",
+        "audio/mpeg": ".mp3",
+        "audio/mp4": ".m4a",
+        "audio/wav": ".wav",
+    }
+    filename = f"voice_note{ext_map.get(mime_type, '.ogg')}"
+
+    response = await client.audio.transcriptions.create(
+        model=whisper_model,
+        file=(filename, BytesIO(audio_bytes), mime_type or "audio/ogg"),
+        response_format="text",
+        language=None,  # auto-detect
+    )
+    return (response or "").strip()
+
+
+async def transcribe_audio_bytes(
+    audio_bytes: bytes,
+    mime_type: Optional[str] = None,
+) -> str:
+    """
+    Transcribe a single in-memory audio blob. Tries Deepgram first, falls
+    back to Groq Whisper if Deepgram fails or is unconfigured.
+    """
+    if os.environ.get("DEEPGRAM_API_KEY"):
+        try:
+            text = await _transcribe_with_deepgram(audio_bytes, mime_type)
+            if text:
+                return text
+            logger.warning("deepgram_empty_transcript_falling_back_to_whisper")
+        except Exception as exc:
+            logger.warning("deepgram_transcribe_failed", extra={"error": str(exc)})
+
+    # Fallback: Groq Whisper
+    try:
+        return await _transcribe_with_groq_whisper(audio_bytes, mime_type)
+    except Exception as exc:
+        logger.warning("groq_whisper_transcribe_failed", extra={"error": str(exc)})
+        return ""
+
+
+async def transcribe_segments(
+    segments: list[VoiceSegment],
+    mime_type: Optional[str] = None,
+) -> list[VoiceSegment]:
+    """
+    Transcribe each VoiceSegment in parallel using Deepgram (with Whisper
+    fallback per-segment). Mutates the input list — fills in `transcript`
+    on each segment. Returns the same list.
+    """
+    if not segments:
+        return segments
+
+    async def _one(seg: VoiceSegment) -> str:
+        return await transcribe_audio_bytes(seg.audio_bytes, "audio/wav")
+
+    transcripts = await asyncio.gather(*[_one(s) for s in segments])
+    for seg, txt in zip(segments, transcripts):
+        seg.transcript = txt
+    return segments
+
+
 async def transcribe_audio(
     media_url: str,
     mime_type: str = None,
     wa_client=None,
 ) -> str:
     """
-    Transcribe audio from a media URL using Groq Whisper (whisper-large-v3).
-    Returns transcript text or empty string on failure.
+    High-level: download audio from `media_url`, transcribe with Deepgram
+    (fallback: Groq Whisper), return transcript text.
 
-    Groq does not extract structured events from audio in a single call the way
-    Gemini does — we transcribe here, and the caller (or ai/extractor.py) is
-    responsible for running event extraction over the resulting transcript if
-    needed.
-
-    FIX (v2): uses download_and_save_media retry logic when wa_client is provided,
-    falling back to httpx for direct URLs (e.g. tests).
+    Used by workflows/process_message.py for short voice notes that go
+    through the single-pass event extraction path. Long voice memos should
+    use transcribe_segments() + ai/extractor.extract_from_audio_segments()
+    instead so Silero VAD can split them into per-utterance events.
     """
-    import os
-    import httpx
-    from io import BytesIO
-
     try:
         if wa_client is not None:
-            # Use retry-enabled download
             try:
                 audio_bytes = await wa_client.download_media(media_url)
             except Exception:
@@ -197,37 +477,27 @@ async def transcribe_audio(
                 logger.warning("transcribe_audio_download_failed", extra={"url": media_url[:80]})
                 return ""
         else:
+            import httpx
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.get(media_url)
                 resp.raise_for_status()
                 audio_bytes = resp.content
 
-        from openai import AsyncOpenAI
-
-        api_key = os.environ.get("GROQ_API_KEY")
-        if not api_key:
-            logger.warning("transcribe_audio_no_groq_key")
-            return ""
-
-        client = AsyncOpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
-        whisper_model = os.environ.get("GROQ_WHISPER_MODEL", "whisper-large-v3")
-
-        # Groq Whisper requires a filename with a recognisable extension
-        ext_map = {
-            "audio/ogg": ".ogg",
-            "audio/mpeg": ".mp3",
-            "audio/mp4": ".m4a",
-            "audio/wav": ".wav",
-        }
-        filename = f"voice_note{ext_map.get(mime_type, '.ogg')}"
-
-        response = await client.audio.transcriptions.create(
-            model=whisper_model,
-            file=(filename, BytesIO(audio_bytes), mime_type or "audio/ogg"),
-            response_format="text",
-            language=None,  # auto-detect (Luganda/Swahili/English mix)
-        )
-        return (response or "").strip()
+        return await transcribe_audio_bytes(audio_bytes, mime_type)
     except Exception as exc:
-        logging.getLogger(__name__).warning("transcribe_audio_failed", extra={"error": str(exc)})
+        logger.warning("transcribe_audio_failed", extra={"error": str(exc)})
         return ""
+
+
+def estimate_audio_duration_seconds(audio_bytes: bytes, mime_type: Optional[str]) -> float:
+    """
+    Best-effort estimate of audio duration in seconds. Used to decide
+    whether to use the segmented path (>30s) or single-pass path (≤30s).
+    Returns 0.0 if duration can't be determined — caller treats unknown
+    durations as "short" (single-pass).
+    """
+    try:
+        samples, sr = _decode_to_pcm_16k_mono(audio_bytes, mime_type)
+        return len(samples) / sr if sr > 0 else 0.0
+    except Exception:
+        return 0.0

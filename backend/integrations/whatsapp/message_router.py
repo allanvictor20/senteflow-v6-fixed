@@ -574,9 +574,19 @@ class MessageRouter:
     # ── Reply / Memory Helpers ────────────────────────────────────────────────
 
     async def _reply(self, event: MessageEvent, text: str) -> None:
+        # Voice-aware reply: if the inbound message was a voice note (or any
+        # audio message), reply with a synthesized voice note via ElevenLabs
+        # instead of plain text. Falls back to text automatically when
+        # ELEVENLABS_API_KEY is not set or synthesis fails.
+        inbound_was_voice = event.message_type in (MessageType.VOICE, MessageType.AUDIO)
         try:
-            from integrations.whatsapp.reply_sender import send
-            await send(self.wa_client, event.chat_id, text)
+            from integrations.whatsapp.reply_sender import send_voice_aware
+            await send_voice_aware(
+                self.wa_client,
+                event.chat_id,
+                text,
+                inbound_was_voice=inbound_was_voice,
+            )
         except Exception as exc:
             logger.error("reply_failed", extra={"error": str(exc), "chat_id": event.chat_id})
 

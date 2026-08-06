@@ -79,8 +79,9 @@ backend/
 │   ├── llm/              ← All Groq/AI calls
 │   │   ├── event_extractor.py     ← message → BusinessEvent (main LLM call)
 │   │   ├── language_pipeline.py   ← Luganda/Swahili normalisation
-│   │   ├── media_processor.py     ← audio transcription, image OCR
-│   │   └── gemini_live.py         ← streaming Gemini session
+│   │   ├── media_processor.py     ← Deepgram STT + Silero VAD segmentation
+│   │   ├── llm_provider.py        ← Groq → Claude → OpenAI fallback chain
+│   │   └── gemini_live.py         ← DEPRECATED — legacy realtime voice, unused
 │   ├── memory/           ← Business memory management
 │   │   ├── context_engine.py         ← assembles context before LLM calls
 │   │   ├── memory_engine.py          ← updates CustomerMemory from events
@@ -160,9 +161,61 @@ EVOLUTION_INSTANCE_NAME
 GOOGLE_APPLICATION_CREDENTIALS
 DEFAULT_ORG_ID
 
-# Optional — only if you enable the legacy live voice WebSocket route
-GEMINI_API_KEY                # legacy Gemini Live realtime voice API (no Groq equivalent)
+# ── Voice note pipeline (recommended) ─────────────────────────────────────
+DEEPGRAM_API_KEY              # https://console.deepgram.com/ — STT for voice notes
+                              # Better Swahili/Luganda accuracy than Whisper,
+                              # auto-detects language, adds punctuation.
+                              # Falls back to Groq Whisper if not set.
+ELEVENLABS_API_KEY            # https://elevenlabs.io/ — TTS for voice replies
+                              # When the customer sends a voice note, the bot
+                              # replies with a synthesized voice note. Falls
+                              # back to plain text if not set.
+ELEVENLABS_VOICE              # voice name (e.g. Rachel, Adam, Bella) — default Rachel
+
+# Optional — legacy Gemini Live voice API
+# The /ws/live route has been removed. GEMINI_API_KEY is now unused; the
+# legacy module is preserved at backend/services/llm/gemini_live.py for
+# reference. Voice interaction now happens via WhatsApp voice notes.
 ```
+
+### Voice notes via WhatsApp
+
+Voice interaction happens entirely inside WhatsApp — no browser needed.
+
+```
+Customer sends voice note
+  → Evolution API webhook
+  → webhook_handler.py normalises it
+  → message_router detects audio
+  → media_extraction_workflow
+  → media_processor.transcribe_audio_bytes()
+      ├─ Deepgram nova-2 (primary — Swahili/Luganda/Sheng)
+      └─ Groq Whisper (fallback)
+  → ai/extractor.extract_from_audio()
+      ├─ Short audio (≤30s): single-pass transcription + one extraction call
+      └─ Long audio (>30s):  Silero VAD segments into utterances,
+                              each segment transcribed + extracted separately,
+                              results merged → multiple events from one memo
+  → reply via reply_sender.send_voice_aware()
+      ├─ If inbound was voice: ElevenLabs TTS → voice note reply
+      └─ Else: plain text reply
+```
+
+**Why Deepgram + Silero + ElevenLabs (instead of one provider):**
+
+- **Deepgram nova-2** has dedicated Swahili support and `language="multi"`
+  auto-detection — critical for Sheng (Swahili/English code-switching).
+  Whisper was trained mostly on English; East African accuracy is poor.
+- **Silero VAD** segments long voice memos into separate utterances so a
+  3-minute end-of-day recap can produce multiple distinct BusinessEvents
+  instead of one merged event. Without VAD, the LLM would parse everything
+  in one shot and miss details.
+- **ElevenLabs turbo** produces natural-sounding voice replies — voice-in,
+  voice-out feels like talking to a person, not a chatbot. Especially
+  valuable for low-literacy users.
+
+All three providers are optional — if any is missing, SenteFlow falls back
+gracefully (Whisper for STT, single-pass for short audio, text for replies).
 
 ### Optional fallback LLM providers
 

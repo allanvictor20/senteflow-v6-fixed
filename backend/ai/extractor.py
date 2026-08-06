@@ -1,18 +1,21 @@
 """
-SenteFlow AI — AI Extraction Layer (Groq edition)
+SenteFlow AI — AI Extraction Layer (Groq + Deepgram edition)
 ==================================================
 Responsibility: Call Groq and return raw ExtractionResult objects.
 This layer does NOT validate, persist, or apply business logic.
 It only converts raw files/bytes into structured domain objects.
 
-Groq notes:
+Provider notes:
   - Text extraction uses `llama-3.3-70b-versatile` (override via GROQ_MODEL).
   - Image extraction uses `llama-3.2-90b-vision-preview` (override via GROQ_VISION_MODEL).
   - PDF: Groq does not accept PDFs directly. We extract text with pypdf,
     then run the text extractor over it.
-  - Audio: Groq does not extract structured events from audio directly.
-    We transcribe with `whisper-large-v3` (Groq's Whisper), then run the
-    text extractor over the transcript.
+  - Audio (≤30s): transcribe with Deepgram nova-2 (fallback: Groq Whisper),
+    then run the text extractor over the transcript.
+  - Audio (>30s): segment with Silero VAD → transcribe each segment with
+    Deepgram → run the text extractor per-segment → merge all events.
+    This lets a 3-minute recap voice memo produce multiple distinct
+    BusinessEvents instead of one merged event.
   - Structured output: Groq supports `response_format={"type": "json_object"}`
     (JSON mode) but not Gemini-style `response_schema`. We embed the schema
     description in the system prompt and parse the JSON with Pydantic.
@@ -313,45 +316,74 @@ def extract_from_audio(
     file_name: str,
 ) -> ExtractionResult:
     """
-    Two-step pipeline:
-      1. Transcribe the audio with Groq Whisper (whisper-large-v3).
-      2. Run the text extractor over the transcript.
-    The transcript is preserved as `raw_transcript` on the result.
+    Audio extraction pipeline:
+      - Short audio (≤30s): single-pass transcription + one extraction call.
+      - Long audio (>30s):  Silero VAD segmentation → per-segment
+        transcription → per-segment extraction → merged result.
+
+    Deepgram nova-2 is the primary STT (better Swahili/Luganda accuracy,
+    auto-language detection for Sheng code-switching, adds punctuation).
+    Falls back to Groq Whisper if Deepgram is not configured.
+
+    The full transcript (all segments concatenated) is preserved as
+    `raw_transcript` on the result for downstream debugging.
     """
-    from io import BytesIO
+    import asyncio
+    from services.llm.media_processor import (
+        estimate_audio_duration_seconds,
+        segment_voice_memo,
+        transcribe_audio_bytes,
+        transcribe_segments,
+        _LONG_AUDIO_THRESHOLD_SECONDS,
+    )
 
-    client = _client_factory()
+    # Step 1: decide single-pass vs segmented
+    duration = estimate_audio_duration_seconds(audio_bytes, mime_type)
+    logger.info(
+        "audio_extraction_starting",
+        extra={
+            "file": file_name,
+            "duration_s": round(duration, 1) if duration else "unknown",
+            "segmented": duration > _LONG_AUDIO_THRESHOLD_SECONDS,
+        },
+    )
 
-    # Step 1: Whisper transcription
-    audio_filename = file_name or "voice_note"
-    if not audio_filename.endswith((".ogg", ".mp3", ".m4a", ".wav", ".mp4")):
-        # Groq Whisper requires a filename extension to detect format
-        ext_map = {
-            "audio/ogg": ".ogg",
-            "audio/mpeg": ".mp3",
-            "audio/mp4": ".m4a",
-            "audio/wav": ".wav",
-        }
-        audio_filename += ext_map.get(mime_type, ".ogg")
-
-    try:
-        transcript_response = client.audio.transcriptions.create(
-            model=DEFAULT_GROQ_WHISPER_MODEL,
-            file=(audio_filename, BytesIO(audio_bytes), mime_type or "audio/ogg"),
-            response_format="text",
-            language=None,  # auto-detect (Luganda/Swahili/English mix)
-        )
-        transcript = (transcript_response or "").strip()
-    except Exception as exc:
-        logger.warning("audio_transcribe_failed", extra={"error": str(exc), "file": file_name})
-        return ExtractionResult(
-            input_type="audio",
-            upload_session_id=session_id,
-            transactions=[],
-            confidence=0.0,
-            summary=f"Audio transcription failed: {exc}",
+    if duration > _LONG_AUDIO_THRESHOLD_SECONDS:
+        return _extract_from_audio_segmented(
+            audio_bytes, mime_type, session_id, file_name
         )
 
+    # ── Short-audio path: single-pass ──────────────────────────────────────
+    # Transcribe with Deepgram (falls back to Whisper internally)
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        # We're inside an async caller (e.g. media_extraction_workflow called
+        # via asyncio.to_thread). Create a fresh loop for the sync path.
+        import threading
+        result_box = {}
+        def _run():
+            try:
+                new_loop = asyncio.new_event_loop()
+                try:
+                    result_box["t"] = new_loop.run_until_complete(
+                        transcribe_audio_bytes(audio_bytes, mime_type)
+                    )
+                finally:
+                    new_loop.close()
+            except Exception as exc:
+                result_box["err"] = exc
+        t = threading.Thread(target=_run)
+        t.start()
+        t.join()
+        if "err" in result_box:
+            raise result_box["err"]
+        transcript = result_box.get("t", "") or ""
+    else:
+        transcript = loop.run_until_complete(
+            transcribe_audio_bytes(audio_bytes, mime_type)
+        )
+
+    transcript = (transcript or "").strip()
     if not transcript:
         logger.warning("audio_empty_transcript", extra={"file": file_name})
         return ExtractionResult(
@@ -380,3 +412,155 @@ def extract_from_audio(
         result.transactions, session_id, file_name, mime_type, transcript
     )
     return result
+
+
+def _extract_from_audio_segmented(
+    audio_bytes: bytes,
+    mime_type: str,
+    session_id: str,
+    file_name: str,
+) -> ExtractionResult:
+    """
+    Long-audio path: Silero VAD segments the audio into separate utterances,
+    each segment is transcribed with Deepgram and run through the LLM
+    extractor independently. All transactions are merged into one result.
+
+    This lets an owner send a 3-minute recap voice memo covering multiple
+    customers/products and have each become its own BusinessEvent, instead
+    of the LLM trying to parse everything in one shot and missing details.
+    """
+    import asyncio
+    from services.llm.media_processor import segment_voice_memo, transcribe_segments
+
+    # Step 1: segment with Silero VAD
+    segments = segment_voice_memo(audio_bytes, mime_type)
+    if not segments:
+        # VAD failed or found no speech — fall back to single-pass
+        logger.warning("audio_vad_no_segments_fallback_single_pass", extra={"file": file_name})
+        # Recursively call extract_from_audio but force the duration check to
+        # take the short path. We do this by transcribing the whole thing
+        # directly here, avoiding infinite recursion.
+        loop = asyncio.get_event_loop()
+        transcript = loop.run_until_complete(
+            transcribe_audio_bytes(audio_bytes, mime_type)
+        ) if not loop.is_running() else _run_async_in_thread(
+            transcribe_audio_bytes(audio_bytes, mime_type)
+        )
+        transcript = (transcript or "").strip()
+        if not transcript:
+            return ExtractionResult(
+                input_type="audio",
+                upload_session_id=session_id,
+                transactions=[],
+                confidence=0.0,
+                summary="Audio transcription returned empty text (VAD fallback).",
+            )
+        user_prompt = (
+            "The following is a transcript of a voice note from a small business owner. "
+            "The speaker may use Luganda, Swahili, English or a mix. "
+            "Extract all business events.\n\n"
+            f"--- TRANSCRIPT ---\n{transcript}\n--- END TRANSCRIPT ---"
+        )
+        result = _run_text_extraction(user_prompt)
+        result = _apply_default_confidence(result)
+        result.input_type = "audio"
+        result.upload_session_id = session_id
+        result.raw_transcript = transcript
+        result.transactions = _attach_source_traces(
+            result.transactions, session_id, file_name, mime_type, transcript
+        )
+        return result
+
+    # Step 2: transcribe each segment with Deepgram (parallel)
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        segments = _run_async_in_thread(transcribe_segments(segments, mime_type))
+    else:
+        segments = loop.run_until_complete(transcribe_segments(segments, mime_type))
+
+    # Filter out segments with empty transcripts
+    valid_segments = [s for s in segments if s.transcript.strip()]
+    if not valid_segments:
+        return ExtractionResult(
+            input_type="audio",
+            upload_session_id=session_id,
+            transactions=[],
+            confidence=0.0,
+            raw_transcript="",
+            summary="All voice segments transcribed as empty.",
+        )
+
+    # Step 3: extract events per-segment (synchronous — uses the OpenAI client)
+    all_transactions = []
+    segment_transcripts = []
+    for idx, seg in enumerate(valid_segments):
+        seg_text = seg.transcript.strip()
+        segment_transcripts.append(seg_text)
+        logger.info(
+            "audio_segment_extracting",
+            extra={"segment": idx, "start_ms": seg.start_ms, "end_ms": seg.end_ms, "chars": len(seg_text)},
+        )
+        user_prompt = (
+            "The following is a transcript of ONE utterance from a small business owner's "
+            "voice memo. The speaker may use Luganda, Swahili, English or a mix. "
+            f"This is segment {idx + 1} of {len(valid_segments)}. "
+            "Extract the business event(s) described in this segment only — do not "
+            "invent events from earlier or later segments.\n\n"
+            f"--- SEGMENT TRANSCRIPT ---\n{seg_text}\n--- END SEGMENT ---"
+        )
+        seg_result = _run_text_extraction(user_prompt)
+        seg_result = _apply_default_confidence(seg_result)
+        # Tag each transaction with which segment it came from
+        for txn in seg_result.transactions:
+            if not txn.notes:
+                txn.notes = f"voice segment {idx + 1}/{len(valid_segments)} ({seg.start_ms//1000}s–{seg.end_ms//1000}s)"
+            else:
+                txn.notes = f"{txn.notes} [segment {idx + 1}/{len(valid_segments)}]"
+            all_transactions.append(txn)
+
+    # Step 4: build merged result
+    full_transcript = "\n\n---\n\n".join(segment_transcripts)
+    merged = ExtractionResult(
+        input_type="audio",
+        upload_session_id=session_id,
+        transactions=all_transactions,
+        confidence=_mean_confidence_or_default(all_transactions),
+        raw_transcript=full_transcript,
+        summary=f"Extracted {len(all_transactions)} event(s) from {len(valid_segments)} voice segment(s).",
+    )
+    merged.transactions = _attach_source_traces(
+        merged.transactions, session_id, file_name, mime_type, full_transcript
+    )
+    return merged
+
+
+def _run_async_in_thread(coro):
+    """Run an async coroutine from within a sync context that's already
+    inside a running loop. Spawns a fresh event loop in a worker thread.
+    """
+    import asyncio, threading
+    box = {}
+    def _run():
+        try:
+            new_loop = asyncio.new_event_loop()
+            try:
+                box["result"] = new_loop.run_until_complete(coro)
+            finally:
+                new_loop.close()
+        except Exception as exc:
+            box["err"] = exc
+    t = threading.Thread(target=_run)
+    t.start()
+    t.join()
+    if "err" in box:
+        raise box["err"]
+    return box.get("result")
+
+
+def _mean_confidence_or_default(transactions: list) -> float:
+    """Compute mean confidence across a list of transactions, return 0.0 if empty."""
+    if not transactions:
+        return 0.0
+    scores = [getattr(t, "field_confidence", None) for t in transactions]
+    valid = [s.mean for s in scores if s is not None and hasattr(s, "mean")]
+    return round(sum(valid) / len(valid), 3) if valid else 0.0

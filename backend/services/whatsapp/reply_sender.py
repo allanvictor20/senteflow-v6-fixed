@@ -1,13 +1,16 @@
-"""Small adapter for sending conversational replies to WhatsApp."""
+"""
+SenteFlow AI — WhatsApp Reply Sender (services/whatsapp/ variant)
+==================================================================
+Re-exports the integrations/whatsapp/reply_sender module so callers in
+services/ and workflows/ that import from `services.whatsapp.reply_sender`
+get the same voice-aware behaviour.
 
+See integrations/whatsapp/reply_sender.py for the actual implementation.
+"""
 
-class WhatsAppReplySender:
-    def __init__(self, wa_client):
-        self.wa_client = wa_client
-
-    async def send(self, chat_id: str, text: str) -> dict:
-        return await self.wa_client.send_text(chat_id, text)
-
-
-async def send(wa_client, chat_id: str, text: str) -> dict:
-    return await WhatsAppReplySender(wa_client).send(chat_id, text)
+from integrations.whatsapp.reply_sender import (  # noqa: F401
+    WhatsAppReplySender,
+    send,
+    send_voice,
+    send_voice_aware,
+)
