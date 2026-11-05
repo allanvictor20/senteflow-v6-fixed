@@ -53,46 +53,54 @@ class BusinessAssistant:
         )
 
     def _unpaid_customers(self) -> AssistantAnswer:
-        unpaid_orders = self.repo.list_orders(self.org_id, payment_status="unpaid", limit=100)
-        customers = self.repo.list_customers(self.org_id, limit=100)
-        debt_customers = [
-            c for c in customers
-            if float(c.get("outstanding_balance") or 0) > 0
-        ]
-        names = [
-            o.get("customer_name") or o.get("customer_id")
-            for o in unpaid_orders[:10]
-        ] + [
-            c.get("display_name") or c.get("sender_id")
-            for c in debt_customers[:10]
-        ]
-        names = [n for n in dict.fromkeys(names) if n]
-        answer = "No unpaid customers found." if not names else "Unpaid customers:\n" + "\n".join(f"- {n}" for n in names)
-        return AssistantAnswer("unpaid_customers", answer, {
-            "orders": unpaid_orders,
-            "customers": debt_customers,
-        })
+        """Customers with an outstanding balance in the ledger (debts − payments)."""
+        from repositories.transaction_repository import SUMMARY_EVENT_LIMIT
+        from services.responses.reply_generator import compute_customer_balances
+
+        transactions = self.repo.list_transactions(self.org_id, limit=SUMMARY_EVENT_LIMIT)
+        balances = compute_customer_balances(transactions)
+        owing = sorted(
+            (v for v in balances.values() if v["balance"] > 0),
+            key=lambda v: v["balance"],
+            reverse=True,
+        )
+        if not owing:
+            answer = "No unpaid customers found."
+        else:
+            answer = "Unpaid customers:\n" + "\n".join(
+                f"- {v['name']}: UGX {v['balance']:,.0f}" for v in owing[:15]
+            )
+        return AssistantAnswer("unpaid_customers", answer, {"customers": owing})
 
     def _pending_deliveries(self) -> AssistantAnswer:
-        orders = self.repo.list_orders(self.org_id, delivery_status="pending", limit=100)
+        orders = [
+            o for o in self.repo.list_orders(self.org_id, limit=100)
+            if o.get("status") != "cancelled" and o.get("delivery_status") not in ("delivered", None)
+        ]
         if not orders:
             answer = "No pending deliveries found."
         else:
             lines = []
             for order in orders[:10]:
                 customer = order.get("customer_name") or order.get("customer_id") or "Unknown customer"
-                item = order.get("items") or order.get("item") or "order"
-                lines.append(f"- {customer}: {item}")
+                lines.append(f"- {customer}: {_items_text(order)}")
             answer = "Pending deliveries:\n" + "\n".join(lines)
         return AssistantAnswer("pending_deliveries", answer, {"orders": orders})
 
-    async def _sales_today(self) -> AssistantAnswer:
-        today = utc_now().date().isoformat()
-        transactions = await self.repo.list_transactions(self.org_id, limit=300)
+    def _sales_today(self) -> AssistantAnswer:
+        # Was declared `async` but called without await, so this answer was a
+        # coroutine object and the endpoint crashed.
+        from utils.clock import local_now, to_naive_utc
+        from datetime import datetime, time
+
+        start_local = datetime.combine(local_now().date(), time.min, tzinfo=local_now().tzinfo)
+        start_utc = to_naive_utc(start_local).isoformat()
+        transactions = self.repo.list_transactions(self.org_id, limit=300)
         todays_sales = [
             t for t in transactions
-            if str(t.get("created_at", "")).startswith(today)
-            and t.get("type") in ("income", "payment", "contribution", "payment_received")
+            if str(t.get("created_at", "")) >= start_utc
+            and (t.get("transaction_type") or t.get("type")) in ("income", "payment", "contribution", "payment_received")
+            and t.get("status") != "rejected"
         ]
         total = sum(float(t.get("amount") or 0) for t in todays_sales)
         return AssistantAnswer(
@@ -113,13 +121,13 @@ class BusinessAssistant:
             answer = "I couldn't find matching orders."
         else:
             answer = "Matching orders:\n" + "\n".join(
-                f"- {(o.get('customer_name') or o.get('customer_id') or 'Customer')}: {o.get('items') or o.get('source_message') or 'order'}"
+                f"- {(o.get('customer_name') or o.get('customer_id') or 'Customer')}: {_items_text(o)}"
                 for o in orders[:10]
             )
         return AssistantAnswer("orders_lookup", answer, {"orders": orders})
 
     def _customer_interests(self, text: str) -> AssistantAnswer:
-        customers = self.repo.list_customers(self.org_id, limit=100)
+        customers = [c for c in self.repo.list_customers(self.org_id, limit=100) if "@" not in str(c.get("id", ""))]
         tokens = [token for token in text.split() if len(token) > 3 and token not in {"show", "customers", "interested"}]
         matches = customers
         if tokens:
@@ -135,3 +143,14 @@ class BusinessAssistant:
                 for c in matches[:10]
             )
         return AssistantAnswer("customer_interests", answer, {"customers": matches})
+
+
+def _items_text(order: dict) -> str:
+    items = order.get("items") or []
+    if isinstance(items, list) and items:
+        names = [
+            (i.get("name") if isinstance(i, dict) else str(i))
+            for i in items
+        ]
+        return ", ".join(n for n in names if n) or "order"
+    return order.get("raw_message") or order.get("source_message") or "order"

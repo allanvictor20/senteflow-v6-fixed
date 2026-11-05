@@ -11,6 +11,7 @@ import AlertsView from "./features/alerts/AlertsView";
 import AskSenteFlow from "./features/ask/AskSenteFlow";
 import BusinessMemoryView from "./features/memory/BusinessMemoryView";
 import ReviewView from "./features/review/ReviewView";
+import WhatsAppNumbers from "./features/settings/WhatsAppNumbers";
 
 // Must match the backend's DEFAULT_ORG_ID. They were "demo-org" and "default"
 // respectively, so the dashboard read a different org than the bot wrote to.
@@ -299,24 +300,16 @@ function TasksView({ transactions = [], alerts = [] }) {
 
 function SettingsView() {
   const [saved, setSaved] = useState(false);
-  const [ownerPhone, setOwnerPhone] = useState(
-    () => localStorage.getItem("sf_owner_phone") || ""
-  );
   const [businessName, setBusinessName] = useState(
     () => localStorage.getItem("sf_business_name") || ""
   );
   const [currency, setCurrency] = useState(
     () => localStorage.getItem("sf_currency") || "UGX"
   );
-  const [briefingEnabled, setBriefingEnabled] = useState(
-    () => localStorage.getItem("sf_briefing") !== "false"
-  );
 
   function handleSave() {
-    localStorage.setItem("sf_owner_phone", ownerPhone);
     localStorage.setItem("sf_business_name", businessName);
     localStorage.setItem("sf_currency", currency);
-    localStorage.setItem("sf_briefing", String(briefingEnabled));
     setSaved(true);
     setTimeout(() => setSaved(false), 2500);
   }
@@ -362,49 +355,15 @@ function SettingsView() {
         </label>
       </div>
 
-      {/* Notifications */}
-      <div style={s.section}>
-        <p style={s.sectionTitle}>Notifications</p>
-        <div style={rowStyle}>
-          <div>
-            <div style={{ color: C.text, fontSize: 14, fontWeight: 600 }}>Daily morning briefing</div>
-            <div style={{ color: C.textMuted, fontSize: 12, marginTop: 2 }}>
-              WhatsApp summary of overdue payments, low stock, and revenue trend
-            </div>
-          </div>
-          <button
-            onClick={() => setBriefingEnabled((v) => !v)}
-            style={{
-              width: 44, height: 24, borderRadius: 12, border: "none", cursor: "pointer",
-              background: briefingEnabled ? C.green : C.border,
-              position: "relative", flexShrink: 0, transition: "background 0.2s",
-            }}
-            aria-label={briefingEnabled ? "Disable briefing" : "Enable briefing"}
-          >
-            <span style={{
-              position: "absolute", top: 3, left: briefingEnabled ? 22 : 3,
-              width: 18, height: 18, borderRadius: "50%", background: C.white,
-              transition: "left 0.2s",
-            }} />
-          </button>
-        </div>
-        <label style={{ ...labelStyle, marginTop: 16 }}>
-          Owner WhatsApp number (for briefings &amp; alerts)
-          <input
-            style={fieldStyle}
-            placeholder="+256 700 000 000"
-            value={ownerPhone}
-            onChange={(e) => setOwnerPhone(e.target.value)}
-          />
-        </label>
-      </div>
+      {/* WhatsApp numbers (server-backed) */}
+      <WhatsAppNumbers orgId={ORG_ID} />
 
       {/* About */}
       <div style={s.section}>
         <p style={s.sectionTitle}>About</p>
         <div style={{ ...rowStyle, borderBottom: "none", paddingBottom: 0 }}>
           <span style={{ color: C.textMuted, fontSize: 13 }}>Version</span>
-          <span style={{ color: C.textDim, fontSize: 13 }}>SenteFlow v6</span>
+          <span style={{ color: C.textDim, fontSize: 13 }}>SenteFlow v7</span>
         </div>
         <div style={{ ...rowStyle, borderBottom: "none", paddingBottom: 0, marginTop: 12 }}>
           <span style={{ color: C.textMuted, fontSize: 13 }}>Backend</span>
@@ -412,7 +371,7 @@ function SettingsView() {
         </div>
         <div style={{ ...rowStyle, borderBottom: "none", paddingBottom: 0, marginTop: 12 }}>
           <span style={{ color: C.textMuted, fontSize: 13 }}>AI providers</span>
-          <span style={{ color: C.textDim, fontSize: 13 }}>Groq → Claude → GPT-4o-mini</span>
+          <span style={{ color: C.textDim, fontSize: 13 }}>Groq → Claude → OpenAI (fallbacks)</span>
         </div>
       </div>
 

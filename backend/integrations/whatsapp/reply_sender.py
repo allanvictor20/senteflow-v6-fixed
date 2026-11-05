@@ -110,63 +110,61 @@ async def send_voice_aware(
 # ── ElevenLabs synthesis ──────────────────────────────────────────────────────
 
 
+def _speakable(text: str) -> str:
+    """Drop WhatsApp formatting marks and emoji so TTS doesn't read them out."""
+    import re
+    cleaned = re.sub(r"[*_~`]", "", text or "")
+    cleaned = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]", "", cleaned)
+    return re.sub(r"[ \t]+", " ", cleaned).strip()
+
+
 async def _synthesize_with_elevenlabs(text: str, voice: Optional[str] = None) -> Optional[bytes]:
     """
-    Call ElevenLabs TTS API to synthesize `text` into MP3 audio bytes.
-    Returns None if the API key isn't set or the call fails.
+    Synthesize `text` into MP3 bytes with ElevenLabs. Returns None if the API
+    key isn't set or the call fails.
+
+    Uses the HTTP API directly: the SDK call was synchronous (it blocked the
+    event loop) and was passed a voice NAME where the API needs a voice ID,
+    so it always failed. ELEVENLABS_VOICE may be either a name or an ID.
     """
     api_key = os.environ.get("ELEVENLABS_API_KEY")
     if not api_key:
         return None
-
     voice_name = voice or os.environ.get("ELEVENLABS_VOICE", "Rachel")
+    return await _synthesize_via_http(_speakable(text), api_key, voice_name)
 
-    # Use the official elevenlabs Python SDK if available — it handles
-    # streaming, retries, and edge cases better than a raw HTTP call.
-    try:
-        from elevenlabs import ElevenLabs
-        client = ElevenLabs(api_key=api_key)
-        # The SDK's text_to_speech.convert method returns a stream of bytes
-        audio_stream = client.text_to_speech.convert(
-            text=text,
-            voice_id=voice_name,
-            model_id="eleven_turbo_v2",
-            output_format="mp3_44100_128",
-        )
-        # Consume the stream into a single bytes object
-        return b"".join(audio_stream)
-    except ImportError:
-        # SDK not installed — fall back to a raw HTTP request
-        return await _synthesize_via_http(text, api_key, voice_name)
-    except Exception as exc:
-        logger.warning("elevenlabs_synthesis_failed", extra={"error": str(exc)})
-        return None
+
+_voice_id_cache: dict[str, str] = {}
 
 
 async def _synthesize_via_http(text: str, api_key: str, voice_name: str) -> Optional[bytes]:
-    """Raw HTTP fallback when the elevenlabs Python SDK isn't installed."""
     import httpx
 
-    # First resolve the voice name to a voice_id (ElevenLabs API uses IDs)
+    model_id = os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2")
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            voices_resp = await client.get(
-                "https://api.elevenlabs.io/v1/voices",
-                headers={"xi-api-key": api_key},
-            )
-            voices_resp.raise_for_status()
-            voices = voices_resp.json().get("voices", [])
+        voice_id = _voice_id_cache.get(voice_name)
+        if not voice_id:
+            async with httpx.AsyncClient(timeout=15) as client:
+                voices_resp = await client.get(
+                    "https://api.elevenlabs.io/v1/voices",
+                    headers={"xi-api-key": api_key},
+                )
+                voices_resp.raise_for_status()
+                voices = voices_resp.json().get("voices", [])
             voice_id = next(
-                (v["voice_id"] for v in voices if v.get("name", "").lower() == voice_name.lower()),
+                (
+                    v["voice_id"] for v in voices
+                    if v.get("voice_id") == voice_name or v.get("name", "").lower() == voice_name.lower()
+                ),
                 None,
             )
-            if not voice_id:
-                # Default to the first available voice if name didn't match
-                voice_id = voices[0]["voice_id"] if voices else None
+            if not voice_id and voices:
+                # Default to the first available voice if the name didn't match
+                voice_id = voices[0]["voice_id"]
             if not voice_id:
                 return None
+            _voice_id_cache[voice_name] = voice_id
 
-        # Then synthesize
         async with httpx.AsyncClient(timeout=30) as client:
             tts_resp = await client.post(
                 f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
@@ -177,7 +175,7 @@ async def _synthesize_via_http(text: str, api_key: str, voice_name: str) -> Opti
                 },
                 json={
                     "text": text,
-                    "model_id": "eleven_turbo_v2",
+                    "model_id": model_id,
                     "voice_settings": {"stability": 0.5, "similarity_boost": 0.7},
                 },
             )

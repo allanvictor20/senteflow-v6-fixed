@@ -38,20 +38,31 @@ class AppDependencies:
     customer_memory_svc: Optional[object] = None
     order_svc: Optional[object] = None
 
-    _message_router: object = field(default=None, repr=False)
+    tenants: Optional[object] = None    # TenantDirectory — phone → org routing
 
-    def message_router(self):
-        if self._message_router is None:
+    _routers: dict = field(default_factory=dict, repr=False)
+
+    def router_for(self, org_id: str):
+        """One MessageRouter per business (org)."""
+        router = self._routers.get(org_id)
+        if router is None:
             from integrations.whatsapp.message_router import MessageRouter
-            self._message_router = MessageRouter(
+            from domain.permissions.model import OrgConfig
+            router = MessageRouter(
                 wa_client=self.wa_client,
                 repo=self.repo,
-                org_id=self.org_id,
+                org_id=org_id,
                 mem_repo=self.mem_repo,
                 profile_repo=self.profile_repo,
-                org_config=self.org_config,
+                org_config=OrgConfig.default(org_id),
+                customer_memory_svc=self.customer_memory_svc,
             )
-        return self._message_router
+            self._routers[org_id] = router
+        return router
+
+    def message_router(self):
+        """Router for the default org (kept for older callers)."""
+        return self.router_for(self.org_id)
 
 
 def build_dependencies(db, org_id: str = "default") -> AppDependencies:
@@ -83,9 +94,20 @@ def build_dependencies(db, org_id: str = "default") -> AppDependencies:
     # OrgConfig: load defaults; in future this can be loaded from Firestore per-org
     org_config = OrgConfig.default(org_id)
 
-    wa_url = os.environ.get("EVOLUTION_API_URL")
-    wa_token = os.environ.get("EVOLUTION_API_TOKEN")
-    wa_instance = os.environ.get("EVOLUTION_INSTANCE_NAME", "senteflow")
+    from services.tenancy import TenantDirectory
+    tenants = TenantDirectory(db, default_org_id=org_id)
+
+    # Both naming schemes are accepted: .env_example used EVOLUTION_API_URL /
+    # EVOLUTION_API_TOKEN, docker-compose used EVOLUTION_BASE_URL /
+    # EVOLUTION_API_KEY. Reading only the first pair left wa_client = None
+    # under docker-compose, so the bot could never reply.
+    wa_url = os.environ.get("EVOLUTION_API_URL") or os.environ.get("EVOLUTION_BASE_URL")
+    wa_token = os.environ.get("EVOLUTION_API_TOKEN") or os.environ.get("EVOLUTION_API_KEY")
+    wa_instance = (
+        os.environ.get("EVOLUTION_INSTANCE_NAME")
+        or os.environ.get("EVOLUTION_SESSION")
+        or "senteflow"
+    )
 
     wa_client = None
     if wa_url and wa_token:
@@ -110,4 +132,5 @@ def build_dependencies(db, org_id: str = "default") -> AppDependencies:
         customer_profile_repo=customer_profile_repo,
         customer_memory_svc=customer_memory_svc,
         order_svc=order_svc,
+        tenants=tenants,
     )

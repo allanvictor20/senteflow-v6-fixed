@@ -54,8 +54,8 @@ _DEFAULT_PERMISSIONS: dict[str, ActionPermission] = {
         "reduce_debt",
         mode=PermissionMode.APPROVAL_REQUIRED,
         approval_question=(
-            "Should I clear this debt? "
-            "Reply YES to confirm the payment was received, or NO to keep it outstanding."
+            "This payment matches an open promise/reminder for this customer. "
+            "Should I mark it as settled? Reply YES to close it, or NO to keep it open."
         ),
     ),
     # High-value threshold: auto up to 500k, ask above
@@ -65,7 +65,7 @@ _DEFAULT_PERMISSIONS: dict[str, ActionPermission] = {
         threshold=500_000,
         approval_question=(
             "This is a large transaction (over UGX 500,000). "
-            "Should I record it? Reply YES to confirm."
+            "Should I record it? Reply YES to record it or NO to cancel."
         ),
     ),
     # Medium-risk: ask before sending reminders to customers

@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 
 def _fmt_amount(amount: float, currency: str = "UGX") -> str:
     """Format amount as human-readable string."""
+    amount = float(amount or 0)
+    if amount < 0:
+        return "-" + _fmt_amount(-amount, currency)
     if amount >= 1_000_000:
         return f"{currency} {amount/1_000_000:.1f}M"
     elif amount >= 1_000:
@@ -70,28 +73,6 @@ async def generate_extraction_reply(result: ExtractionResult, saved_ids: list[st
     return "\n".join(lines)
 
 
-# ─── Transaction Recorded Reply ───────────────────────────────────────────────
-
-async def generate_reply(event_type: str, data: object) -> str:
-    """
-    Generate a reply for a specific event type.
-    """
-    if event_type == "transaction_recorded":
-        # from domain.models import Transaction  # DEPRECATED — use BusinessEvent
-        if isinstance(data, Transaction):
-            amount_str = _fmt_amount(data.amount, data.currency)
-            person = data.payer or data.payee or "Unknown"
-            return (
-                f"✅ *Transaction recorded*\n\n"
-                f"💰 {amount_str}\n"
-                f"👤 {person}\n"
-                f"📂 {data.category.replace('_', ' ').title()}\n"
-                f"📝 {data.description}"
-            )
-
-    return "✅ Done."
-
-
 # ─── Summary Reply ────────────────────────────────────────────────────────────
 
 def generate_summary_reply(summary: FinancialSummary) -> str:
@@ -129,21 +110,26 @@ def generate_recent_reply(transactions: list[dict]) -> str:
     """
     Format recent transactions for WhatsApp.
     """
+    # Only ledger entries carry a top-level amount; the BusinessEvent records
+    # stored alongside them would otherwise show up as "UGX 0" lines.
+    transactions = [t for t in transactions if _as_float(t.get("amount")) and t.get("status") != "rejected"]
     if not transactions:
         return "📋 No transactions recorded yet.\n\nSend a receipt photo or voice note to get started!"
 
     lines = [f"📋 *Last {min(len(transactions), 10)} Transactions*\n"]
 
     for txn in transactions[:10]:
-        amount = txn.get("amount", 0)
-        currency = txn.get("currency", "UGX")
-        desc = txn.get("description", "Transaction")[:40]
-        person = txn.get("payer") or txn.get("payee") or ""
-        date = txn.get("date", "")[:10]  # YYYY-MM-DD only
-        txn_type = txn.get("transaction_type", "")
+        amount = _as_float(txn.get("amount"))
+        currency = txn.get("currency") or "UGX"
+        desc = str(txn.get("description") or "Transaction")[:40]
+        person = txn.get("customer_name") or txn.get("payer") or txn.get("payee") or ""
+        date = str(txn.get("date") or txn.get("created_at") or "")[:10]  # YYYY-MM-DD only
+        txn_type = txn.get("transaction_type") or txn.get("event_type") or ""
 
         # Income vs expense indicator
-        emoji = "💚" if txn_type in ("income", "contribution", "payment") else "🔴"
+        emoji = "💚" if txn_type in ("income", "contribution", "payment", "payment_received") else (
+            "📒" if txn_type == "debt_created" else "🔴"
+        )
         amount_str = _fmt_amount(amount, currency)
 
         line = f"{emoji} {amount_str}"
@@ -161,45 +147,132 @@ def generate_recent_reply(transactions: list[dict]) -> str:
 
 # ─── Debt Reply ───────────────────────────────────────────────────────────────
 
-def generate_debt_reply(transactions: list[dict], name_query: Optional[str] = None) -> str:
-    """
-    Compute and format outstanding debt information.
-    """
-    # Aggregate by payer
-    balances: dict[str, float] = {}
-    for txn in transactions:
-        payer = (txn.get("payer") or txn.get("member_name") or "").strip()
-        if not payer:
-            continue
-        amount = float(txn.get("amount", 0))
-        txn_type = txn.get("transaction_type", "")
-        if txn_type in ("contribution", "payment", "loan_repayment"):
-            balances[payer] = balances.get(payer, 0) + amount
-        elif txn_type in ("loan", "withdrawal"):
-            balances[payer] = balances.get(payer, 0) - amount
+def _as_float(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
-    if not balances:
-        return "No member payment data found."
 
-    # Filter by name if provided
-    if name_query:
-        matched = {k: v for k, v in balances.items() if name_query.lower() in k.lower()}
-        if matched:
-            lines = [f"💳 *Balance for '{name_query}'*\n"]
-            for name, balance in matched.items():
-                sign = "+" if balance >= 0 else ""
-                lines.append(f"  {name}: {sign}{_fmt_amount(balance)}")
-            return "\n".join(lines)
+_DEBT_TYPES = {"debt_created", "loan", "withdrawal"}
+_PAYMENT_TYPES = {"payment", "payment_received", "income", "loan_repayment", "contribution"}
+
+
+def compute_customer_balances(transactions: list[dict]) -> dict[str, dict]:
+    """
+    Outstanding balance per customer from the ledger: debts minus payments.
+
+    Entries are grouped by customer_id when they have one, otherwise by name.
+    Name-only entries (written before customer resolution existed) are folded
+    into the matching customer_id when any entry links that name to an id.
+    """
+    rows = [t for t in transactions if t.get("status") != "rejected"]
+
+    name_to_id: dict[str, str] = {}
+    for t in rows:
+        cid = t.get("customer_id")
+        name = (t.get("customer_name") or t.get("debtor") or t.get("payer") or "").strip().lower()
+        if cid and name:
+            name_to_id.setdefault(name, cid)
+
+    balances: dict[str, dict] = {}
+    for t in rows:
+        txn_type = t.get("transaction_type") or t.get("event_type") or t.get("type") or ""
+        if txn_type in _DEBT_TYPES:
+            sign = 1
+            name = t.get("customer_name") or t.get("debtor") or t.get("payer") or t.get("member_name")
+        elif txn_type in _PAYMENT_TYPES:
+            sign = -1
+            name = t.get("customer_name") or t.get("payer") or t.get("member_name")
         else:
+            continue
+        name = (name or "").strip()
+        if not name and not t.get("customer_id"):
+            continue
+        key = t.get("customer_id") or name_to_id.get(name.lower()) or name.lower()
+        entry = balances.setdefault(key, {"name": name or key, "owed": 0.0, "paid": 0.0})
+        if name and (not entry["name"] or entry["name"] == key):
+            entry["name"] = name
+        amount = _as_float(t.get("amount"))
+        if sign > 0:
+            entry["owed"] += amount
+        else:
+            entry["paid"] += amount
+
+    for entry in balances.values():
+        entry["balance"] = round(entry["owed"] - entry["paid"], 2)
+    return balances
+
+
+def generate_debt_reply(
+    transactions: list[dict],
+    name_query: Optional[str] = None,
+    open_promises: Optional[list[dict]] = None,
+) -> str:
+    """
+    "Who owes me?" / "How much does Brian owe?" from the ledger.
+
+    Debts come from debt_created entries (and legacy loan/withdrawal entries);
+    payments reduce them. Open payment promises are listed separately because
+    a promise is not always backed by a recorded debt.
+    """
+    balances = compute_customer_balances(transactions)
+    promises = []
+    for p in open_promises or []:
+        entities = p.get("entities") or {}
+        who = entities.get("customer") or entities.get("debtor") or p.get("debtor") or "Someone"
+        promises.append({
+            "name": str(who),
+            "amount": _as_float(entities.get("amount") or p.get("amount")),
+            "due": entities.get("due_date") or p.get("due_date_display") or "",
+        })
+
+    if name_query:
+        q = name_query.lower().strip()
+        matched = {k: v for k, v in balances.items() if q in v["name"].lower()}
+        matched_promises = [p for p in promises if q in p["name"].lower()]
+        if not matched and not matched_promises:
             return f"No records found for '{name_query}'."
+        lines = [f"💳 *Balance for '{name_query}'*\n"]
+        for entry in matched.values():
+            if entry["balance"] > 0:
+                lines.append(f"  {entry['name']}: owes {_fmt_amount(entry['balance'])}")
+            elif entry["balance"] < 0:
+                lines.append(f"  {entry['name']}: in credit {_fmt_amount(-entry['balance'])}")
+            else:
+                lines.append(f"  {entry['name']}: fully paid ✅")
+            lines.append(f"     (debts {_fmt_amount(entry['owed'])} · paid {_fmt_amount(entry['paid'])})")
+        for p in matched_promises:
+            due = f" by {p['due']}" if p["due"] else ""
+            amt = f" {_fmt_amount(p['amount'])}" if p["amount"] else ""
+            lines.append(f"  📅 Promised to pay{amt}{due}")
+        return "\n".join(lines)
 
-    # Show all outstanding (negative balance = owes money)
-    outstanding = {k: v for k, v in balances.items() if v < 0}
-    if not outstanding:
-        return "✅ No outstanding debts found. All members are up to date."
+    outstanding = sorted(
+        (v for v in balances.values() if v["balance"] > 0),
+        key=lambda v: v["balance"],
+        reverse=True,
+    )
+    if not outstanding and not promises:
+        return "✅ No outstanding debts found. Everyone is up to date."
 
-    lines = [f"⚠️ *Outstanding Debts ({len(outstanding)} member{'s' if len(outstanding) != 1 else ''})*\n"]
-    for name, balance in sorted(outstanding.items(), key=lambda x: x[1]):
-        lines.append(f"  • {name}: {_fmt_amount(abs(balance))} owes")
-
+    lines: list[str] = []
+    if outstanding:
+        total = sum(v["balance"] for v in outstanding)
+        lines.append(
+            f"⚠️ *Outstanding debts ({len(outstanding)} customer{'s' if len(outstanding) != 1 else ''})*"
+            f" — total {_fmt_amount(total)}\n"
+        )
+        for v in outstanding[:15]:
+            lines.append(f"  • {v['name']}: {_fmt_amount(v['balance'])}")
+        if len(outstanding) > 15:
+            lines.append(f"  _... and {len(outstanding) - 15} more_")
+    if promises:
+        if lines:
+            lines.append("")
+        lines.append("📅 *Open payment promises*")
+        for p in promises[:10]:
+            due = f" by {p['due']}" if p["due"] else ""
+            amt = f" {_fmt_amount(p['amount'])}" if p["amount"] else ""
+            lines.append(f"  • {p['name']}{amt}{due}")
     return "\n".join(lines)

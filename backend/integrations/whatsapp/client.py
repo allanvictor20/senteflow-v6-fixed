@@ -27,10 +27,20 @@ class EvolutionClient:
         timeout: int = 30,
     ):
         self.base_url = (
-            base_url or os.environ.get("EVOLUTION_BASE_URL", "http://localhost:8080")
+            base_url
+            or os.environ.get("EVOLUTION_API_URL")
+            or os.environ.get("EVOLUTION_BASE_URL", "http://localhost:8080")
         ).rstrip("/")
-        self.api_key = api_key or os.environ.get("EVOLUTION_API_KEY", "")
-        self.session = session or os.environ.get("EVOLUTION_SESSION", "senteflow")
+        self.api_key = (
+            api_key
+            or os.environ.get("EVOLUTION_API_TOKEN")
+            or os.environ.get("EVOLUTION_API_KEY", "")
+        )
+        self.session = (
+            session
+            or os.environ.get("EVOLUTION_INSTANCE_NAME")
+            or os.environ.get("EVOLUTION_SESSION", "senteflow")
+        )
         self.timeout = timeout
         self._headers = {
             "Content-Type": "application/json",
@@ -115,6 +125,35 @@ class EvolutionClient:
         )
         return result.get("base64") or result.get("url")
 
+    async def get_media_bytes(self, message_id: str, remote_jid: Optional[str] = None) -> Optional[bytes]:
+        """
+        Download and DECRYPT a media message through Evolution API.
+
+        The `url` inside a WhatsApp webhook points at WhatsApp's CDN, where
+        the file is stored encrypted (.enc); fetching it directly returns
+        ciphertext. Evolution's getBase64FromMediaMessage decrypts it with the
+        message's media key and returns base64.
+        """
+        import base64
+
+        key: dict = {"id": message_id}
+        if remote_jid:
+            key["remoteJid"] = remote_jid
+        result = await self._post(
+            f"/chat/getBase64FromMediaMessage/{self.session}",
+            {"message": {"key": key}, "convertToMp4": False},
+        )
+        b64 = result.get("base64") if isinstance(result, dict) else None
+        if not b64:
+            return None
+        if "," in b64[:100] and b64.lstrip().startswith("data:"):
+            b64 = b64.split(",", 1)[1]
+        try:
+            return base64.b64decode(b64)
+        except Exception as exc:
+            logger.error("evolution_media_base64_invalid", extra={"error": str(exc)})
+            return None
+
     async def create_instance_if_needed(self) -> dict:
         """Create the Evolution API instance if it does not already exist."""
         async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -167,6 +206,15 @@ class EvolutionClient:
                     extra={"endpoint": endpoint, "error": str(exc)},
                 )
                 return {"error": str(exc)}
+
+
+def send_succeeded(result) -> bool:
+    """
+    `_post` never raises — it returns {"error": ...} on failure. Callers that
+    must know whether a message actually went out (reminders, briefings) use
+    this instead of assuming success.
+    """
+    return not (isinstance(result, dict) and result.get("error"))
 
 
 # Transitional alias for any imports not yet updated.

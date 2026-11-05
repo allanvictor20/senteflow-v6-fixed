@@ -1,0 +1,16 @@
+# Secrets must never be baked into the image — pass them as environment
+# variables / mounted files at runtime (see docker-compose.yml).
+.env
+.env.*
+!.env_example
+*service-account*.json
+firebase-*.json
+
+# Local data and caches
+storage/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+tests/

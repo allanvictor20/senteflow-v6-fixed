@@ -23,17 +23,14 @@ import uuid
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
-from core.auth import verify_firebase_token, verify_org_access
+from core.auth import verify_firebase_token, verify_org_access, require_org, token_identity
 from core.errors import SenteFlowError, StructuredLogger, success_response
 from workflows.media_extraction_workflow import run_media_extraction
 from repositories.transaction_repository import TransactionRepository
 
-# NOTE: The legacy /ws/live WebSocket route (which used Google's Gemini Live
-# realtime voice API) has been removed. Live voice chat is not currently
-# exposed as a separate feature — voice interaction happens via WhatsApp
-# voice notes (transcribed by Deepgram, replies synthesized by ElevenLabs).
-# The old GeminiLive module (services/llm/gemini_live.py) is preserved as
-# legacy reference but is no longer reachable from any active route.
+# NOTE: The legacy /ws/live WebSocket route (Gemini Live realtime voice) has
+# been removed; it now only answers with a "deprecated" message. Voice
+# interaction happens via WhatsApp voice notes.
 
 logger = StructuredLogger(__name__)
 
@@ -55,6 +52,9 @@ def _require_repo() -> TransactionRepository:
     return _repo
 
 
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "20")) * 1024 * 1024
+
+
 # ─── Routers ─────────────────────────────────────────────────────────────────
 
 health_router = APIRouter()
@@ -71,7 +71,7 @@ assistant_router = APIRouter()
 
 @health_router.get("/health")
 def health():
-    return {"status": "ok", "service": "SenteFlow AI", "version": "3.0.0"}
+    return {"status": "ok", "service": "SenteFlow AI", "version": "7.0.0"}
 
 
 # ─── Extract ──────────────────────────────────────────────────────────────────
@@ -80,7 +80,7 @@ def health():
 async def extract(
     file: UploadFile = File(...),
     org_id: str = Form(...),
-    uploaded_by: str = Form(...),
+    uploaded_by: str = Form(""),   # ignored — the uploader is taken from the token
     invoice_prompt: str = Form(None),
     _token: dict = Depends(verify_firebase_token),
 ):
@@ -90,11 +90,18 @@ async def extract(
     Runs AI extraction → deterministic validation → returns structured transactions.
     Does NOT save to Firestore — awaits human approval.
     """
-    logger.info("extract_request", file_name=file.filename, org_id=org_id, uploaded_by=uploaded_by)
+    # Only members of this business may run (paid) AI extraction for it.
+    await require_org(_token, org_id)
+    logger.info("extract_request", file_name=file.filename, org_id=org_id, uploaded_by=token_identity(_token))
+
+    file_content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(file_content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"File too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)")
+    if not file_content:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty")
 
     suffix = os.path.splitext(file.filename or "upload")[1] or ".bin"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        file_content = await file.read()
         tmp.write(file_content)
         tmp_path = tmp.name
 
@@ -149,7 +156,10 @@ async def extract(
 class ApprovalRequest(BaseModel):
     transactions: list[dict]
     org_id: str
-    approved_by: str
+    # Ignored: the approver is taken from the verified token, so the audit
+    # trail can't be written in someone else's name. Kept so existing
+    # clients that still send it don't get a validation error.
+    approved_by: str = ""
     session_id: str = ""
 
 
@@ -165,12 +175,23 @@ async def approve_transactions(req: ApprovalRequest, _token: dict = Depends(veri
     Human approval endpoint. Saves approved transactions with full audit metadata.
     Checks for cross-session duplicates before saving.
     """
-    _require_repo()
-    logger.info("approve_request", count=len(req.transactions), org_id=req.org_id, approved_by=req.approved_by)
+    # The org comes from the request body, so the membership check must be
+    # explicit — without it any signed-in Google user could write approved
+    # transactions into any business.
+    await require_org(_token, req.org_id)
+    repo = _require_repo()
+    approver = token_identity(_token)
+    logger.info("approve_request", count=len(req.transactions), org_id=req.org_id, approved_by=approver)
 
-    saved_ids, skipped = _repo.save_approved_batch(
-        req.transactions, req.org_id, req.approved_by, req.session_id
-    )
+    from services.ledger import prepare_extracted_records
+
+    def _save():
+        records = prepare_extracted_records(repo, req.org_id, req.transactions)
+        for r in records:
+            r.setdefault("source", "upload")
+        return repo.save_approved_batch(records, req.org_id, approver, req.session_id)
+
+    saved_ids, skipped = await asyncio.to_thread(_save)
 
     logger.info("approve_complete", saved=len(saved_ids), duplicates_skipped=len(skipped))
 
@@ -187,15 +208,15 @@ async def approve_transactions(req: ApprovalRequest, _token: dict = Depends(veri
 
 @transaction_router.get("/transactions/{org_id}")
 async def get_transactions(org_id: str, status: str = None, limit: int = 100, _: dict = Depends(verify_org_access)):
-    _require_repo()
-    transactions = _repo.list_transactions(org_id, status=status, limit=limit)
+    repo = _require_repo()
+    transactions = await asyncio.to_thread(repo.list_transactions, org_id, limit=min(limit, 500), status=status)
     return success_response({"transactions": transactions, "count": len(transactions)})
 
 
 @transaction_router.get("/pending/{org_id}")
 async def get_pending(org_id: str, _: dict = Depends(verify_org_access)):
-    _require_repo()
-    transactions = _repo.list_transactions(org_id, status="pending")
+    repo = _require_repo()
+    transactions = await asyncio.to_thread(repo.list_transactions, org_id, status="pending")
     return success_response({"transactions": transactions, "count": len(transactions)})
 
 
@@ -203,8 +224,8 @@ async def get_pending(org_id: str, _: dict = Depends(verify_org_access)):
 
 @summary_router.get("/summary/{org_id}")
 async def get_summary(org_id: str, _: dict = Depends(verify_org_access)):
-    _require_repo()
-    summary = _repo.compute_financial_summary(org_id)
+    repo = _require_repo()
+    summary = await asyncio.to_thread(repo.compute_financial_summary, org_id)
     return success_response(summary.model_dump())
 
 
@@ -213,16 +234,15 @@ async def assistant_query(
     req: AssistantQueryRequest,
     _token: dict = Depends(verify_firebase_token),
 ):
-    from core.auth import ensure_org_access
     from services.assistant.business_assistant import BusinessAssistant
 
     # org_id arrives in the body here, so the org check has to be explicit —
     # the Depends(verify_org_access) form only reads query/path parameters.
-    ensure_org_access(_token, req.org_id)
-    _require_repo()
+    await require_org(_token, req.org_id)
+    repo = _require_repo()
 
-    assistant = BusinessAssistant(_repo, req.org_id)
-    answer = assistant.answer(req.question, req.sender_id or None)
+    assistant = BusinessAssistant(repo, req.org_id)
+    answer = await asyncio.to_thread(assistant.answer, req.question, req.sender_id or None)
     return success_response({
         "intent": answer.intent,
         "answer": answer.answer,
@@ -232,8 +252,10 @@ async def assistant_query(
 
 @assistant_router.get("/customers/{org_id}")
 async def get_customers(org_id: str, limit: int = 100, _: dict = Depends(verify_org_access)):
-    _require_repo()
-    customers = _repo.list_customers(org_id, limit=limit)
+    repo = _require_repo()
+    customers = await asyncio.to_thread(repo.list_customers, org_id, limit=min(limit, 500))
+    # Hide the per-sender records older versions wrote (keyed by WhatsApp id).
+    customers = [c for c in customers if "@" not in str(c.get("id", ""))]
     return success_response({"customers": customers, "count": len(customers)})
 
 
@@ -246,21 +268,22 @@ async def get_orders(
     limit: int = 100,
     _: dict = Depends(verify_org_access),
 ):
-    _require_repo()
-    orders = _repo.list_orders(
+    repo = _require_repo()
+    orders = await asyncio.to_thread(
+        repo.list_orders,
         org_id,
         status=status,
         payment_status=payment_status,
         delivery_status=delivery_status,
-        limit=limit,
+        limit=min(limit, 500),
     )
     return success_response({"orders": orders, "count": len(orders)})
 
 
 @assistant_router.get("/media-assets/{org_id}")
 async def get_media_assets(org_id: str, limit: int = 50, _: dict = Depends(verify_org_access)):
-    _require_repo()
-    assets = _repo.list_media_assets(org_id, limit=limit)
+    repo = _require_repo()
+    assets = await asyncio.to_thread(repo.list_media_assets, org_id, limit=min(limit, 500))
     return success_response({"media_assets": assets, "count": len(assets)})
 
 
@@ -268,8 +291,8 @@ async def get_media_assets(org_id: str, limit: int = 50, _: dict = Depends(verif
 
 @audit_router.get("/audit/{org_id}/{transaction_id}")
 async def get_transaction_evidence(org_id: str, transaction_id: str, _: dict = Depends(verify_org_access)):
-    _require_repo()
-    data = _repo.get_transaction(org_id, transaction_id)
+    repo = _require_repo()
+    data = await asyncio.to_thread(repo.get_transaction, org_id, transaction_id)
     if not data:
         raise HTTPException(status_code=404, detail="Transaction not found")
     return success_response({

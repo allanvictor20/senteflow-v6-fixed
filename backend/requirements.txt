@@ -1,21 +1,14 @@
 # SenteFlow AI - Backend Dependencies (v6 — Groq + Deepgram + ElevenLabs)
 
-# Primary LLM: Groq (OpenAI-compatible API)
-groq>=0.11.0
-
+# Primary LLM: Groq, called through its OpenAI-compatible API with the openai SDK.
 # Fallback LLM providers (optional, configure via env vars)
 anthropic>=0.40.0
 openai>=1.50.0
 
 # ── Voice note pipeline ──────────────────────────────────────────────────────
-# Deepgram nova-2 — streaming/batch STT. Better Swahili/Luganda accuracy than
-# Whisper, adds punctuation, ~3x faster. Used by services/llm/media_processor.py
-deepgram-sdk>=3.7.0
-
-# ElevenLabs — TTS for voice note replies. When the customer sends a voice
-# note, the bot replies with a synthesized voice note (same channel, same
-# modality). Used by integrations/whatsapp/reply_sender.py
-elevenlabs>=1.0.0
+# Deepgram (STT) and ElevenLabs (TTS for voice-note replies) are called over
+# their REST APIs with httpx — no SDKs needed. Their SDKs changed APIs across
+# major versions, which broke both integrations silently.
 
 # Silero VAD — segments long voice memos into separate utterances so a single
 # 3-minute recap can produce multiple distinct business events. Used by
@@ -40,6 +33,9 @@ websockets>=12.0
 # Data validation
 pydantic>=2.0.0
 
+# Time zone data for BUSINESS_TZ (slim images ship without the system tz database)
+tzdata>=2024.1
+
 # Environment variables
 python-dotenv>=1.0.0
 
@@ -53,11 +49,5 @@ pypdf>=4.0.0
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
 
-slowapi>=0.1.9
 sentry-sdk[fastapi]>=2.0.0
-prometheus-fastapi-instrumentator>=6.0.0
 
-# Optional: required only if you re-enable the legacy Gemini Live realtime voice
-# route (services/llm/gemini_live.py). This module is preserved as reference
-# but no active route calls it — voice interaction now uses WhatsApp voice notes.
-# google-genai>=1.0.0

@@ -112,28 +112,23 @@ class VoiceSegment:
 
 
 async def download_and_save_media(
-    media_url: str,
+    media_url: Optional[str],
     mime_type: Optional[str],
     sender_id: str,
     source_hint: str,
     wa_client: "EvolutionClient",
+    message_id: Optional[str] = None,
+    remote_jid: Optional[str] = None,
 ) -> str:
     """
     Download media from WhatsApp and save to local storage.
 
-    FIX (v2): raises MediaDownloadError on failure (was: silently returns None).
-    The caller (message_router._process_media_extraction) catches this and
-    sends a specific error message back to the WhatsApp user.
-
-    Args:
-        media_url:   URL to download the media from
-        mime_type:   MIME type of the media (determines subfolder and extension)
-        sender_id:   WhatsApp sender ID (used for audit trail naming)
-        source_hint: "receipt", "voice_note", or "document"
-        wa_client:   Evolution API client instance for downloading
-
-    Returns:
-        Local file path if successful.
+    Download order:
+      1. Evolution's getBase64FromMediaMessage (by message id) — returns the
+         DECRYPTED file. This is the only reliable source: the `url` in a
+         WhatsApp webhook points at the encrypted .enc file on WhatsApp's CDN.
+      2. A direct URL download, but only for URLs that are not WhatsApp's
+         encrypted CDN (e.g. Evolution configured with S3/MinIO storage).
 
     Raises:
         MediaDownloadError: if all download attempts fail.
@@ -150,16 +145,21 @@ async def download_and_save_media(
     os.makedirs(dest_dir, exist_ok=True)
     dest_path = os.path.join(dest_dir, filename)
 
-    # FIX (v2): retry loop for transient Evolution API URL expiry
+    direct_url_ok = bool(media_url) and not _is_encrypted_whatsapp_url(media_url)
+
     last_error: Optional[str] = None
     for attempt in range(1, _DOWNLOAD_RETRIES + 1):
+        media_bytes: Optional[bytes] = None
         try:
-            media_bytes = await wa_client.download_media(media_url)
+            if message_id and hasattr(wa_client, "get_media_bytes"):
+                media_bytes = await wa_client.get_media_bytes(message_id, remote_jid)
+            if not media_bytes and direct_url_ok:
+                media_bytes = await wa_client.download_media(media_url)
         except Exception as exc:
             last_error = f"download exception (attempt {attempt}): {exc}"
             logger.warning(
                 "media_download_exception",
-                extra={"attempt": attempt, "url": media_url[:80], "error": str(exc)},
+                extra={"attempt": attempt, "message_id": message_id, "error": str(exc)},
             )
             if attempt < _DOWNLOAD_RETRIES:
                 await asyncio.sleep(_RETRY_DELAY_SECONDS)
@@ -169,13 +169,12 @@ async def download_and_save_media(
             last_error = f"empty response from Evolution API (attempt {attempt})"
             logger.warning(
                 "media_download_empty",
-                extra={"attempt": attempt, "url": media_url[:80], "sender": safe_sender},
+                extra={"attempt": attempt, "message_id": message_id, "sender": safe_sender},
             )
             if attempt < _DOWNLOAD_RETRIES:
                 await asyncio.sleep(_RETRY_DELAY_SECONDS)
             continue
 
-        # Download succeeded — write to disk
         try:
             with open(dest_path, "wb") as f:
                 f.write(media_bytes)
@@ -192,13 +191,17 @@ async def download_and_save_media(
         except Exception as exc:
             last_error = f"disk write failed: {exc}"
             logger.error("media_write_failed", extra={"error": str(exc), "path": dest_path})
-            # Disk write failure is not retryable
             raise MediaDownloadError(last_error) from exc
 
-    # All attempts exhausted
     raise MediaDownloadError(
         f"Failed to download media after {_DOWNLOAD_RETRIES} attempts. Last error: {last_error}"
     )
+
+
+def _is_encrypted_whatsapp_url(url: str) -> bool:
+    """WhatsApp CDN media is AES-encrypted; downloading it directly yields ciphertext."""
+    lowered = (url or "").lower()
+    return "whatsapp.net" in lowered or lowered.split("?")[0].endswith(".enc")
 
 
 # ── Audio decoding & VAD ──────────────────────────────────────────────────────
@@ -333,42 +336,39 @@ async def _transcribe_with_deepgram(audio_bytes: bytes, mime_type: Optional[str]
     """
     Send the audio bytes to Deepgram's nova-2 model with auto-language detection.
     Returns the transcript text. Raises on failure.
+
+    Calls the REST API directly. The previous code used the v3 SDK interface
+    (`listen.asyncprerecorded`), but requirements allowed any newer major
+    version, whose API is different — so the import failed and every voice
+    note silently fell back to Whisper.
     """
-    import os
-    from deepgram import DeepgramClient, PrerecordedOptions, FileSource
+    import httpx
 
     api_key = os.environ.get("DEEPGRAM_API_KEY")
     if not api_key:
         raise RuntimeError("DEEPGRAM_API_KEY not set")
 
-    client = DeepgramClient(api_key)
-
-    payload: FileSource = {"buffer": audio_bytes}
-    options = PrerecordedOptions(
-        model="nova-2",
-        # "multi" enables auto-language detection — critical for Sheng
-        # (Swahili/English code-switching) which is common in East Africa.
-        language="multi",
-        smart_format=True,        # add punctuation + capitalization
-        detect_language=True,
-        punctuate=True,
-        utterances=False,         # we use Silero for segmentation, not Deepgram
-    )
-
-    response = await client.listen.asyncprerecorded.v("1").transcribe_file(payload, options)
-
-    # Deepgram returns a channel/alternative structure. Take the first
-    # alternative of the first channel — that's the full transcript.
+    params = {
+        "model": os.environ.get("DEEPGRAM_MODEL", "nova-2"),
+        # "multi" enables auto-language detection — useful for code-switching.
+        "language": os.environ.get("DEEPGRAM_LANGUAGE", "multi"),
+        "smart_format": "true",
+        "punctuate": "true",
+    }
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(
+            "https://api.deepgram.com/v1/listen",
+            params=params,
+            headers={
+                "Authorization": f"Token {api_key}",
+                "Content-Type": mime_type or "audio/ogg",
+            },
+            content=audio_bytes,
+        )
+        resp.raise_for_status()
+        data = resp.json()
     try:
-        channels = response.results.channels
-        if channels and channels[0].alternatives:
-            return (channels[0].alternatives[0].transcript or "").strip()
-    except (AttributeError, IndexError):
-        pass
-
-    # Fallback: try the dict shape (older SDK versions return dicts)
-    try:
-        return (response["results"]["channels"][0]["alternatives"][0]["transcript"] or "").strip()
+        return (data["results"]["channels"][0]["alternatives"][0]["transcript"] or "").strip()
     except (KeyError, IndexError, TypeError):
         return ""
 
@@ -388,7 +388,8 @@ async def _transcribe_with_groq_whisper(audio_bytes: bytes, mime_type: Optional[
         raise RuntimeError("GROQ_API_KEY not set")
 
     client = AsyncOpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
-    whisper_model = os.environ.get("GROQ_WHISPER_MODEL", "whisper-large-v3")
+    from services.llm.models import whisper_model as _whisper_model
+    whisper_model = _whisper_model()
 
     ext_map = {
         "audio/ogg": ".ogg",
@@ -453,40 +454,26 @@ async def transcribe_segments(
     return segments
 
 
-async def transcribe_audio(
-    media_url: str,
-    mime_type: str = None,
-    wa_client=None,
-) -> str:
+async def transcribe_voice_note(audio_bytes: bytes, mime_type: Optional[str]) -> list[str]:
     """
-    High-level: download audio from `media_url`, transcribe with Deepgram
-    (fallback: Groq Whisper), return transcript text.
+    Transcribe a WhatsApp voice note into one or more utterances.
 
-    Used by workflows/process_message.py for short voice notes that go
-    through the single-pass event extraction path. Long voice memos should
-    use transcribe_segments() + ai/extractor.extract_from_audio_segments()
-    instead so Silero VAD can split them into per-utterance events.
+    Short notes → one transcript. Long notes (> _LONG_AUDIO_THRESHOLD_SECONDS)
+    are split with Silero VAD so a 3-minute recap ("Brian paid 50k... Sarah
+    took 3 bags on credit...") becomes separate messages, each processed as
+    its own business event. Decoding/VAD is CPU work, so it runs off the
+    event loop.
     """
-    try:
-        if wa_client is not None:
-            try:
-                audio_bytes = await wa_client.download_media(media_url)
-            except Exception:
-                audio_bytes = None
-            if not audio_bytes:
-                logger.warning("transcribe_audio_download_failed", extra={"url": media_url[:80]})
-                return ""
-        else:
-            import httpx
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.get(media_url)
-                resp.raise_for_status()
-                audio_bytes = resp.content
-
-        return await transcribe_audio_bytes(audio_bytes, mime_type)
-    except Exception as exc:
-        logger.warning("transcribe_audio_failed", extra={"error": str(exc)})
-        return ""
+    duration = await asyncio.to_thread(estimate_audio_duration_seconds, audio_bytes, mime_type)
+    if duration > _LONG_AUDIO_THRESHOLD_SECONDS:
+        segments = await asyncio.to_thread(segment_voice_memo, audio_bytes, mime_type)
+        if segments:
+            segments = await transcribe_segments(segments, mime_type)
+            texts = [s.transcript.strip() for s in segments if s.transcript and s.transcript.strip()]
+            if texts:
+                return texts
+    text = (await transcribe_audio_bytes(audio_bytes, mime_type)).strip()
+    return [text] if text else []
 
 
 def estimate_audio_duration_seconds(audio_bytes: bytes, mime_type: Optional[str]) -> float:

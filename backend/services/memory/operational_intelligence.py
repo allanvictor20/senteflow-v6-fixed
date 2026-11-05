@@ -26,6 +26,8 @@ def detect_lost_customers(customers: list[dict], days_threshold: int = 45) -> li
     cutoff = utc_now() - timedelta(days=days_threshold)
     lost = []
     for customer in customers:
+        if "@" in str(customer.get("id") or ""):
+            continue  # legacy per-sender record, not a customer
         last_dt = _parse_dt(customer.get("last_interaction") or customer.get("last_contact"))
         if last_dt and last_dt < cutoff:
             lost.append({
@@ -52,18 +54,44 @@ def detect_repeat_customers(events: list[dict], min_purchases: int = 3) -> list[
     return [value for value in counts.values() if value["event_count"] >= min_purchases]
 
 
+_INACTIVE = {"pending", "cancelled", "failed"}
+
+
+def _counts(event: dict) -> bool:
+    """Skip events that never took effect (awaiting approval, cancelled, rejected)."""
+    if event.get("status") == "rejected":
+        return False
+    return event.get("processing_status") not in _INACTIVE
+
+
 def detect_overdue_debts(events: list[dict]) -> list[dict]:
+    """
+    Payment promises past their due date. Accepts promise documents or
+    events. `due_at` (set by SenteFlow, naive UTC) wins; otherwise the
+    entity due_date is parsed (ISO dates or words like "Friday").
+    """
+    from utils.dates import parse_due_date
+
     today = utc_now()
     overdue = []
     for event in events:
         if (event.get("event_type") or event.get("type")) != "payment_promise":
             continue
+        if event.get("status") in ("resolved", "cancelled"):
+            continue
         entities = event.get("entities") or {}
-        due = _parse_dt(entities.get("due_date") or event.get("due_date"))
+        due = _parse_dt(event.get("due_at"))
+        if due is None:
+            raw_due = entities.get("due_date") or event.get("due_date")
+            due = _parse_dt(raw_due)
+            if due is None:
+                parsed = parse_due_date(raw_due)
+                if parsed is not None:
+                    due = datetime.combine(parsed, datetime.max.time())
         if due and due < today:
             overdue.append({
                 "event_id": event.get("event_id") or event.get("id"),
-                "debtor": entities.get("debtor") or entities.get("customer"),
+                "debtor": entities.get("customer") or entities.get("debtor") or event.get("debtor"),
                 "amount": entities.get("amount"),
                 "days_overdue": (today - due).days,
                 "due_date": due.isoformat(),
@@ -106,6 +134,8 @@ def detect_revenue_trends(events: list[dict]) -> dict:
 
     for event in events:
         if (event.get("event_type") or event.get("type")) not in {"payment_received", "payment", "income"}:
+            continue
+        if not _counts(event):
             continue
         amount = float((event.get("entities") or {}).get("amount") or event.get("amount") or 0)
         ts = _parse_dt(event.get("timestamp") or event.get("created_at"))

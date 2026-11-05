@@ -156,3 +156,28 @@ export async function askBusinessAssistant(orgId, question, senderId = "") {
   });
   return unwrap(await handleResponse(res));
 }
+
+
+// ── WhatsApp numbers linked to this business ─────────────────────────────────
+// Only these numbers can talk to SenteFlow on WhatsApp; they also receive the
+// morning briefing and payment reminders.
+
+export async function listWhatsAppNumbers(orgId) {
+  const url = withParams("/api/org/phones", { org_id: orgId });
+  return handleResponse(await apiFetch(url));
+}
+
+export async function linkWhatsAppNumber(orgId, phone, label = "") {
+  const url = withParams("/api/org/phones", { org_id: orgId });
+  const res = await apiFetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ phone, label }),
+  });
+  return handleResponse(res);
+}
+
+export async function unlinkWhatsAppNumber(orgId, phone) {
+  const url = withParams(`/api/org/phones/${encodeURIComponent(phone)}`, { org_id: orgId });
+  return handleResponse(await apiFetch(url, { method: "DELETE" }));
+}

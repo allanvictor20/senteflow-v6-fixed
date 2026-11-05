@@ -4,6 +4,8 @@ SenteFlow AI — CustomerProfile Repository
 Firestore persistence for the rich CustomerProfile model.
 """
 
+
+from __future__ import annotations
 import logging
 
 
@@ -83,6 +85,15 @@ class CustomerProfileRepository:
             phone_number=phone,
             display_name=display_name,
         )
+        self.upsert(org_id, profile)
+        return profile
+
+    def get_or_create_by_id(self, org_id: str, customer_id: str, display_name: str) -> CustomerProfile:
+        """Profile keyed by the same id as the customer record (customers/{id})."""
+        existing = self.get(org_id, customer_id)
+        if existing:
+            return existing
+        profile = CustomerProfile(id=customer_id, org_id=org_id, display_name=display_name or "Unknown")
         self.upsert(org_id, profile)
         return profile
 

@@ -1,19 +1,23 @@
-# SenteFlow AI — v5
+# SenteFlow AI — v7
 
 **WhatsApp-native AI business memory assistant for small businesses in East Africa.**
 
-Instead of learning ERP software, business owners text SenteFlow on WhatsApp the same way they already talk — and SenteFlow remembers, organises, and acts on everything.
+Instead of learning ERP software, a business owner keeps doing what they already do — talking to their customers on WhatsApp — and tells SenteFlow, on a separate WhatsApp chat, what happened. SenteFlow remembers, organises, and follows up. The owner never has to leave WhatsApp.
 
 ---
 
 ## What SenteFlow Does
 
-SenteFlow listens to WhatsApp conversations and builds a living memory of your business:
+The owner (or their staff) messages SenteFlow:
 
-- A customer says "I'll pay Friday" → SenteFlow records the promise and reminds you if they don't
-- A supplier sends a delivery note → SenteFlow logs the stock update
-- You say "Only 3 bags cement left" → SenteFlow raises a low-stock alert
-- You ask "Who owes me money?" → SenteFlow searches its memory and replies instantly
+- "Brian took 3 bags of cement on credit, 150k, will pay Friday" → debt recorded for Brian, reminder set for Saturday morning
+- "Brian paid 50k" → payment recorded; Brian now owes 100k
+- A MoMo screenshot or receipt photo → transactions extracted and recorded
+- A voice note (English, Luganda, Swahili, mixed) → transcribed and handled like a text
+- "Who owes me money?" / "How much does Brian owe?" / "summary" → answered from the records
+- Every morning at 7am → a briefing: overdue promises, low stock, quiet customers, revenue trend
+
+Customers never message SenteFlow. **The sender is always the owner; the customer is whoever the owner is talking about.** Each business only sees its own data, and only numbers linked to a business can use it.
 
 ---
 
@@ -21,14 +25,11 @@ SenteFlow listens to WhatsApp conversations and builds a living memory of your b
 
 > A message does not become a transaction. A message becomes a **BusinessEvent**.
 
-Transactions are only one type of business event. SenteFlow understands all of them:
-
 ```
-sale · expense · payment_received · payment_promised
-order_created · order_completed · delivery_requested
-customer_inquiry · negotiation · complaint
-inventory_update · low_stock_alert
-supplier_message · reminder_request
+sale · expense · payment_received · payment_promise · debt_created
+order_created · customer_inquiry · negotiation · complaint
+inventory_update · low_stock_alert · supplier_message
+reminder_request · business_query
 ```
 
 ---
@@ -36,19 +37,26 @@ supplier_message · reminder_request
 ## System Flow
 
 ```
-Incoming WhatsApp Message
-          ↓
-  ContextEngine.build()       ← load customer memory, open orders, history
-          ↓
-  EventExtractor (Groq)       ← classify into BusinessEvent
-          ↓
-  UpdateMemoryWorkflow        ← persist what we learned
-          ↓
-  ActionDispatcher            ← ledger, reminders, alerts
-          ↓
-  GenerateReplyWorkflow       ← craft WhatsApp response
-          ↓
-  WhatsApp Reply
+WhatsApp message to the SenteFlow number
+  → Evolution API webhook  (POST /api/webhooks/whatsapp)
+  → normalise + de-duplicate + queue (Firestore)            → 200 OK fast
+  → which business is this number linked to?  (services/tenancy.py)
+        unknown number → "not linked" reply, no data
+  → that business's MessageRouter
+      pending question?  YES/NO approval · reminder "YES" · clarification answer
+      ContextEngine                 owner-level context
+      EventExtractor (LLM)          message → BusinessEvent
+      business_query?               answer from the ledger, stop
+      unsure about money?           ask BEFORE recording
+      CustomerResolver              "Brian" → which customer (asks if ambiguous)
+      ActionDispatcher              ledger · reminders · orders · profiles
+                                    (pauses for YES on big amounts / closing debts)
+  → WhatsApp reply (voice note if the owner sent one)
+
+Background (per business):
+  reminder_loop        hourly — promises due, follow-ups
+  daily_briefing_loop  once a day after BRIEFING_HOUR local time
+  webhook recovery     re-runs messages a restart interrupted
 ```
 
 ---
@@ -57,59 +65,27 @@ Incoming WhatsApp Message
 
 ```
 backend/
-├── domain/               ← Pure data models, no I/O
-│   ├── events/           ← BusinessEvent, EventType (the core)
-│   ├── customers/        ← Customer, CustomerProfile
-│   ├── conversations/    ← BusinessConversation, ConversationStage
-│   ├── orders/           ← Order, OrderStatus
-│   ├── reminders/        ← Reminder
-│   ├── debts/            ← Debt, DebtStatus
-│   └── business_memory/  ← CustomerMemory (long-term memory per customer)
-│
-├── workflows/            ← Business orchestration (the glue)
-│   ├── process_message.py    ← MAIN ENTRY POINT for a WhatsApp message
-│   ├── build_event.py        ← raw text → BusinessEvent
-│   ├── update_memory.py      ← event → memory update
-│   ├── generate_reply.py     ← event → WhatsApp reply
-│   ├── handle_order.py       ← order-related events → Order record
-│   ├── handle_payment.py     ← financial events → ledger
-│   └── event_extraction_workflow.py  ← file upload → BusinessEvents
-│
-├── services/             ← Pure capabilities (no orchestration)
-│   ├── llm/              ← All Groq/AI calls
-│   │   ├── event_extractor.py     ← message → BusinessEvent (main LLM call)
-│   │   ├── language_pipeline.py   ← Luganda/Swahili normalisation
-│   │   ├── media_processor.py     ← Deepgram STT + Silero VAD segmentation
-│   │   ├── llm_provider.py        ← Groq → Claude → OpenAI fallback chain
-│   │   └── gemini_live.py         ← DEPRECATED — legacy realtime voice, unused
-│   ├── memory/           ← Business memory management
-│   │   ├── context_engine.py         ← assembles context before LLM calls
-│   │   ├── memory_engine.py          ← updates CustomerMemory from events
-│   │   ├── customer_memory_service.py
-│   │   └── operational_intelligence.py  ← detect lost customers, overdue debts
-│   └── whatsapp/         ← WhatsApp send primitives
-│       ├── client.py
-│       └── reply_sender.py
-│
-├── repositories/         ← Firestore persistence, no business logic
-│   ├── event_repository.py
-│   ├── customer_repository.py
-│   ├── conversation_repository.py
-│   ├── memory_repository.py
-│   └── order_repository.py
-│
-├── integrations/
-│   └── whatsapp/         ← Evolution API webhook handling + message routing
-│
-├── bootstrap/            ← App construction + dependency wiring
-│   ├── app_factory.py
-│   └── dependency_injection.py
-│
-├── api/routes/           ← FastAPI route handlers
-├── prompts/              ← LLM system prompts
-├── utils/                ← currency normalisation, helpers
-├── tasks/                ← Background tasks (reminder sender)
-└── main.py               ← Entry point
+├── main.py                ← entry point, background loops
+├── bootstrap/             ← app factory + dependency wiring (per-business routers)
+├── api/
+│   ├── routes/whatsapp.py ← webhook, queue, tenancy routing, recovery
+│   ├── routes/org.py      ← link/unlink WhatsApp numbers for a business
+│   ├── routes/*.py        ← customers, orders, tasks, insights
+│   └── routes_legacy.py   ← /extract, /approve, /summary, ... (dashboard)
+├── integrations/whatsapp/ ← Evolution client, normaliser, router, reply sender
+├── services/
+│   ├── tenancy.py         ← phone number → business
+│   ├── llm/               ← provider chain, models, extractor, media/voice
+│   ├── actions/           ← ActionDispatcher + tools
+│   ├── conversation/      ← customer resolution, state machine, entity links
+│   ├── memory/            ← context engine, customer memory, insights
+│   ├── responses/         ← WhatsApp reply text, ledger balances
+│   └── ledger.py          ← saving extracted transactions
+├── tasks/                 ← reminder_sender.py, briefing.py
+├── repositories/          ← Firestore persistence
+├── domain/                ← pure models (BusinessEvent, Order, permissions, ...)
+├── workflows/             ← media_extraction_workflow.py (files → transactions)
+└── tests/                 ← unit + end-to-end (in-memory Firestore)
 ```
 
 ---
@@ -117,16 +93,24 @@ backend/
 ## Firestore Collections
 
 ```
+phone_index/{digits}                 ← WhatsApp number → org_id (server-only)
 organizations/{org_id}/
-  events/{event_id}           ← all BusinessEvents (replaces transactions/)
-  customers/{customer_id}     ← customer records
-  conversations/{sender_id}   ← active conversation state per customer
-  memory/{customer_id}        ← CustomerMemory (long-term per-customer facts)
-  orders/{order_id}           ← order records
-  reminders/{reminder_id}     ← scheduled follow-ups
-  promises/{event_id}         ← payment promises (subset of events)
-  alerts/{event_id}           ← operational alerts
+  events/{id}             ← BusinessEvents and ledger entries
+  customers/{customer_id} ← customers (resolved from message content)
+  customer_profiles/{id}  ← rich profile, same id as the customer
+  memory/{customer_id}    ← CustomerMemory
+  conversations/{id}      ← owner chat state (pending questions) / customer flow state
+    interactions/{id}     ← owner ↔ SenteFlow message log
+  orders/{order_id}
+  reminders/{event_id}    ← due_at drives when the owner is nudged
+  promises/{event_id}
+  alerts/{event_id}
+  webhook_queue/{msg_id}  ← server-only
+  meta/briefing_{date}    ← once-a-day briefing marker
+  members/{uid}           ← dashboard access
 ```
+
+Deploy `firestore.rules` with the Firebase CLI after changing it.
 
 ---
 
@@ -135,99 +119,74 @@ organizations/{org_id}/
 ```bash
 # Backend
 cd backend
-cp .env.example .env          # fill in your keys
+cp .env_example .env          # fill in your keys + OWNER_PHONES
 pip install -r requirements.txt
 uvicorn main:app --reload
 
 # Frontend
 cd frontend
-cp .env.example .env          # fill in Firebase config
+cp .env_example .env          # Firebase config + REACT_APP_ORG_ID (= DEFAULT_ORG_ID)
 npm install
-npm run dev
+npm start
 ```
 
-### Required environment variables
+Or everything with Docker: `docker compose up` (set the variables in a root `.env`).
+
+### Linking WhatsApp numbers
+
+Only linked numbers can use SenteFlow:
+
+- Default business: put the owner/staff numbers in `OWNER_PHONES` (comma-separated, e.g. `+256700000001,+256700000002`).
+- Any business: dashboard → Settings → WhatsApp numbers (or `POST /api/org/phones?org_id=...`).
+
+### Environment variables
+
+See `backend/.env_example` for the full annotated list. The essentials:
 
 ```
-GROQ_API_KEY
-GROQ_MODEL                    # optional, defaults to llama-3.3-70b-versatile
-GROQ_VISION_MODEL             # optional, defaults to llama-3.2-90b-vision-preview
-GROQ_WHISPER_MODEL            # optional, defaults to whisper-large-v3
-WHATSAPP_VERIFY_TOKEN
-WHATSAPP_ACCESS_TOKEN
-EVOLUTION_API_URL
-EVOLUTION_API_TOKEN
-EVOLUTION_INSTANCE_NAME
-GOOGLE_APPLICATION_CREDENTIALS
-DEFAULT_ORG_ID
-
-# ── Voice note pipeline (recommended) ─────────────────────────────────────
-DEEPGRAM_API_KEY              # https://console.deepgram.com/ — STT for voice notes
-                              # Better Swahili/Luganda accuracy than Whisper,
-                              # auto-detects language, adds punctuation.
-                              # Falls back to Groq Whisper if not set.
-ELEVENLABS_API_KEY            # https://elevenlabs.io/ — TTS for voice replies
-                              # When the customer sends a voice note, the bot
-                              # replies with a synthesized voice note. Falls
-                              # back to plain text if not set.
-ELEVENLABS_VOICE              # voice name (e.g. Rachel, Adam, Bella) — default Rachel
-
-# Optional — legacy Gemini Live voice API
-# The /ws/live route has been removed. GEMINI_API_KEY is now unused; the
-# legacy module is preserved at backend/services/llm/gemini_live.py for
-# reference. Voice interaction now happens via WhatsApp voice notes.
+GROQ_API_KEY                  required
+GROQ_MODEL / GROQ_VISION_MODEL / GROQ_WHISPER_MODEL
+                              optional — defaults: openai/gpt-oss-120b,
+                              qwen/qwen3.8-27b, whisper-large-v3.
+                              Groq retired llama-3.3-70b-versatile and the
+                              llama vision models; retired names are ignored
+                              with a warning.
+ANTHROPIC_API_KEY / OPENAI_API_KEY      optional fallbacks
+EVOLUTION_API_URL, EVOLUTION_API_TOKEN, EVOLUTION_INSTANCE_NAME
+GOOGLE_APPLICATION_CREDENTIALS, DEFAULT_ORG_ID
+OWNER_PHONES                  numbers allowed for the default business
+BUSINESS_TZ (Africa/Kampala), BRIEFING_HOUR (7)
+DEEPGRAM_API_KEY              optional — voice notes (falls back to Groq Whisper)
+ELEVENLABS_API_KEY            optional — voice-note replies (falls back to text)
+SENTRY_DSN                    optional
+ENVIRONMENT                   production (default) enforces auth + webhook checks
 ```
 
-### Voice notes via WhatsApp
+### Tests
 
-Voice interaction happens entirely inside WhatsApp — no browser needed.
-
-```
-Customer sends voice note
-  → Evolution API webhook
-  → webhook_handler.py normalises it
-  → message_router detects audio
-  → media_extraction_workflow
-  → media_processor.transcribe_audio_bytes()
-      ├─ Deepgram nova-2 (primary — Swahili/Luganda/Sheng)
-      └─ Groq Whisper (fallback)
-  → ai/extractor.extract_from_audio()
-      ├─ Short audio (≤30s): single-pass transcription + one extraction call
-      └─ Long audio (>30s):  Silero VAD segments into utterances,
-                              each segment transcribed + extracted separately,
-                              results merged → multiple events from one memo
-  → reply via reply_sender.send_voice_aware()
-      ├─ If inbound was voice: ElevenLabs TTS → voice note reply
-      └─ Else: plain text reply
+```bash
+cd backend && python -m pytest -q
 ```
 
-**Why Deepgram + Silero + ElevenLabs (instead of one provider):**
+`tests/test_end_to_end.py` drives real webhook payloads through the whole app against an in-memory Firestore with the LLM faked.
 
-- **Deepgram nova-2** has dedicated Swahili support and `language="multi"`
-  auto-detection — critical for Sheng (Swahili/English code-switching).
-  Whisper was trained mostly on English; East African accuracy is poor.
-- **Silero VAD** segments long voice memos into separate utterances so a
-  3-minute end-of-day recap can produce multiple distinct BusinessEvents
-  instead of one merged event. Without VAD, the LLM would parse everything
-  in one shot and miss details.
-- **ElevenLabs turbo** produces natural-sounding voice replies — voice-in,
-  voice-out feels like talking to a person, not a chatbot. Especially
-  valuable for low-literacy users.
+---
 
-All three providers are optional — if any is missing, SenteFlow falls back
-gracefully (Whisper for STT, single-pass for short audio, text for replies).
-
-### Optional fallback LLM providers
+## Voice notes
 
 ```
-ANTHROPIC_API_KEY             # Claude Haiku — used if Groq quota is exhausted
-OPENAI_API_KEY                # OpenAI gpt-4o-mini — last-resort fallback
+Owner sends a voice note
+  → decrypted download via Evolution (getBase64FromMediaMessage)
+  → transcription: Deepgram (if configured) → Groq Whisper fallback
+     long notes (>30s) are split into utterances with Silero VAD
+  → each utterance goes through the normal text flow
+     (so voice can record debts, ask "who owes me?", answer YES, ...)
+  → reply as a voice note via ElevenLabs (if configured), else text
 ```
 
 ---
 
-## Migration from v3
+## Migration notes
 
-See `docs/migration_v3_to_v4.md`.
-
-The short version: v3 extracted Transactions. v4 extracts BusinessEvents. Transactions are now just one event type among many.
+- v7: see `CHANGES_V7.md`. Existing deployments: set `OWNER_PHONES`, clear any retired `GROQ_*` model names from `.env`, and redeploy `firestore.rules`.
+- v3 → v4: see `docs/migration_v3_to_v4.md`.
