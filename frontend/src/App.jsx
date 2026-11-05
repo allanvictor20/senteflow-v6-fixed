@@ -12,6 +12,7 @@ import AskSenteFlow from "./features/ask/AskSenteFlow";
 import BusinessMemoryView from "./features/memory/BusinessMemoryView";
 import ReviewView from "./features/review/ReviewView";
 import WhatsAppNumbers from "./features/settings/WhatsAppNumbers";
+import BusinessProfile from "./features/settings/BusinessProfile";
 
 // Must match the backend's DEFAULT_ORG_ID. They were "demo-org" and "default"
 // respectively, so the dashboard read a different org than the bot wrote to.
@@ -299,23 +300,6 @@ function TasksView({ transactions = [], alerts = [] }) {
 }
 
 function SettingsView() {
-  const [saved, setSaved] = useState(false);
-  const [businessName, setBusinessName] = useState(
-    () => localStorage.getItem("sf_business_name") || ""
-  );
-  const [currency, setCurrency] = useState(
-    () => localStorage.getItem("sf_currency") || "UGX"
-  );
-
-  function handleSave() {
-    localStorage.setItem("sf_business_name", businessName);
-    localStorage.setItem("sf_currency", currency);
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2500);
-  }
-
-  const fieldStyle = { ...s.input, width: "100%", marginTop: 8 };
-  const labelStyle = { color: C.textDim, fontSize: 13, fontWeight: 600, display: "block", marginTop: 16 };
   const rowStyle = { display: "flex", justifyContent: "space-between", alignItems: "center", paddingBottom: 12, borderBottom: `1px solid ${C.border}` };
 
   return (
@@ -327,33 +311,8 @@ function SettingsView() {
         </div>
       </div>
 
-      {/* Business profile */}
-      <div style={s.section}>
-        <p style={s.sectionTitle}>Business Profile</p>
-        <label style={labelStyle}>
-          Business name
-          <input
-            style={fieldStyle}
-            placeholder="e.g. Kamu General Supplies"
-            value={businessName}
-            onChange={(e) => setBusinessName(e.target.value)}
-          />
-        </label>
-        <label style={labelStyle}>
-          Default currency
-          <select
-            style={{ ...s.select, width: "100%", marginTop: 8 }}
-            value={currency}
-            onChange={(e) => setCurrency(e.target.value)}
-          >
-            <option value="UGX">UGX — Ugandan Shilling</option>
-            <option value="KES">KES — Kenyan Shilling</option>
-            <option value="TZS">TZS — Tanzanian Shilling</option>
-            <option value="RWF">RWF — Rwandan Franc</option>
-            <option value="USD">USD — US Dollar</option>
-          </select>
-        </label>
-      </div>
+      {/* Business profile (server-backed, read by the AI) */}
+      <BusinessProfile orgId={ORG_ID} />
 
       {/* WhatsApp numbers (server-backed) */}
       <WhatsAppNumbers orgId={ORG_ID} />
@@ -373,18 +332,6 @@ function SettingsView() {
           <span style={{ color: C.textMuted, fontSize: 13 }}>AI providers</span>
           <span style={{ color: C.textDim, fontSize: 13 }}>Groq → Claude → OpenAI (fallbacks)</span>
         </div>
-      </div>
-
-      {/* Save button */}
-      <div style={{ display: "flex", gap: 12, alignItems: "center", marginTop: 4 }}>
-        <button style={s.primaryBtn} onClick={handleSave}>
-          Save settings
-        </button>
-        {saved && (
-          <span style={{ color: C.green, fontSize: 13, fontWeight: 600 }}>
-            ✓ Saved
-          </span>
-        )}
       </div>
     </div>
   );

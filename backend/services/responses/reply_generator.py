@@ -75,7 +75,7 @@ async def generate_extraction_reply(result: ExtractionResult, saved_ids: list[st
 
 # ─── Summary Reply ────────────────────────────────────────────────────────────
 
-def generate_summary_reply(summary: FinancialSummary) -> str:
+def generate_summary_reply(summary: FinancialSummary, currency: str = "UGX") -> str:
     """
     Format a financial summary for WhatsApp.
     """
@@ -84,22 +84,22 @@ def generate_summary_reply(summary: FinancialSummary) -> str:
 
     lines = [
         "📊 *Financial Summary*\n",
-        f"💚 Income:   {_fmt_amount(summary.total_income)}",
-        f"🔴 Expenses: {_fmt_amount(summary.total_expenses)}",
-        f"{balance_emoji} Balance:  {balance_sign}{_fmt_amount(summary.balance)}\n",
+        f"💚 Income:   {_fmt_amount(summary.total_income, currency)}",
+        f"🔴 Expenses: {_fmt_amount(summary.total_expenses, currency)}",
+        f"{balance_emoji} Balance:  {balance_sign}{_fmt_amount(summary.balance, currency)}\n",
     ]
 
     if summary.members_paid > 0:
         lines.append(f"👥 Members paid: {summary.members_paid}")
     if summary.members_pending > 0:
         lines.append(f"⏳ Members pending: {summary.members_pending}")
-        lines.append(f"   Outstanding: {_fmt_amount(summary.pending_amount)}")
+        lines.append(f"   Outstanding: {_fmt_amount(summary.pending_amount, currency)}")
 
     if summary.categories:
         lines.append("\n📂 *Top Categories:*")
         sorted_cats = sorted(summary.categories.items(), key=lambda x: x[1], reverse=True)
         for cat, amount in sorted_cats[:5]:
-            lines.append(f"  • {cat.replace('_', ' ').title()}: {_fmt_amount(amount)}")
+            lines.append(f"  • {cat.replace('_', ' ').title()}: {_fmt_amount(amount, currency)}")
 
     return "\n".join(lines)
 
@@ -208,6 +208,7 @@ def generate_debt_reply(
     transactions: list[dict],
     name_query: Optional[str] = None,
     open_promises: Optional[list[dict]] = None,
+    currency: str = "UGX",
 ) -> str:
     """
     "Who owes me?" / "How much does Brian owe?" from the ledger.
@@ -236,15 +237,15 @@ def generate_debt_reply(
         lines = [f"💳 *Balance for '{name_query}'*\n"]
         for entry in matched.values():
             if entry["balance"] > 0:
-                lines.append(f"  {entry['name']}: owes {_fmt_amount(entry['balance'])}")
+                lines.append(f"  {entry['name']}: owes {_fmt_amount(entry['balance'], currency)}")
             elif entry["balance"] < 0:
-                lines.append(f"  {entry['name']}: in credit {_fmt_amount(-entry['balance'])}")
+                lines.append(f"  {entry['name']}: in credit {_fmt_amount(-entry['balance'], currency)}")
             else:
                 lines.append(f"  {entry['name']}: fully paid ✅")
-            lines.append(f"     (debts {_fmt_amount(entry['owed'])} · paid {_fmt_amount(entry['paid'])})")
+            lines.append(f"     (debts {_fmt_amount(entry['owed'], currency)} · paid {_fmt_amount(entry['paid'], currency)})")
         for p in matched_promises:
             due = f" by {p['due']}" if p["due"] else ""
-            amt = f" {_fmt_amount(p['amount'])}" if p["amount"] else ""
+            amt = f" {_fmt_amount(p['amount'], currency)}" if p["amount"] else ""
             lines.append(f"  📅 Promised to pay{amt}{due}")
         return "\n".join(lines)
 
@@ -261,10 +262,10 @@ def generate_debt_reply(
         total = sum(v["balance"] for v in outstanding)
         lines.append(
             f"⚠️ *Outstanding debts ({len(outstanding)} customer{'s' if len(outstanding) != 1 else ''})*"
-            f" — total {_fmt_amount(total)}\n"
+            f" — total {_fmt_amount(total, currency)}\n"
         )
         for v in outstanding[:15]:
-            lines.append(f"  • {v['name']}: {_fmt_amount(v['balance'])}")
+            lines.append(f"  • {v['name']}: {_fmt_amount(v['balance'], currency)}")
         if len(outstanding) > 15:
             lines.append(f"  _... and {len(outstanding) - 15} more_")
     if promises:
@@ -273,6 +274,6 @@ def generate_debt_reply(
         lines.append("📅 *Open payment promises*")
         for p in promises[:10]:
             due = f" by {p['due']}" if p["due"] else ""
-            amt = f" {_fmt_amount(p['amount'])}" if p["amount"] else ""
+            amt = f" {_fmt_amount(p['amount'], currency)}" if p["amount"] else ""
             lines.append(f"  • {p['name']}{amt}{due}")
     return "\n".join(lines)

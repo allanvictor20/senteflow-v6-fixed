@@ -315,7 +315,11 @@ async def mark_reminders_settled(repo, org_id: str, reminder_ids: list[str], own
             except Exception as exc:
                 logger.warning("reminder_payment_record_failed", extra={"id": reminder_id, "error": str(exc)})
 
-        settled.append({"debtor": reminder.get("debtor") or "Someone", "amount": amount if isinstance(amount, (int, float)) else None})
+        settled.append({
+            "debtor": reminder.get("debtor") or "Someone",
+            "amount": amount if isinstance(amount, (int, float)) else None,
+            "currency": reminder.get("currency"),
+        })
     return settled
 
 

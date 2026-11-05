@@ -103,9 +103,23 @@ the sender was the customer; v7 fixes that throughout.
   `elevenlabs`, `slowapi`, `prometheus-fastapi-instrumentator`).
 - Version strings aligned at 7.0.0; README rewritten for the current flow.
 
+## Business profile settings
+
+- Settings → Business profile is now stored on the server
+  (`organizations/{org}/profile/config`, `GET/PUT /api/org/profile`) instead of
+  the browser. It was previously saved only to localStorage, so the backend
+  never saw it.
+- The AI already reads this profile on every message; the page now also edits
+  what you sell, location, credit policy and notes.
+- The default currency is applied to amounts the owner doesn't label and used
+  in summaries, "who owes me?", reminders and the briefing (UGX, KES, TZS,
+  RWF, USD).
+- The owner-number field and briefing toggle (also browser-only, so they did
+  nothing) were replaced by the server-backed WhatsApp numbers section.
+
 ## Tests
 
-193 passing, including `tests/test_end_to_end.py`, which sends real webhook
+197 passing, including `tests/test_end_to_end.py`, which sends real webhook
 payloads through the whole app against an in-memory Firestore.
 
 ## Upgrading an existing deployment

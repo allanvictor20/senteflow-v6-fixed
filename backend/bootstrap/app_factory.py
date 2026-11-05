@@ -69,7 +69,7 @@ def create_app(deps=None) -> FastAPI:
         # needs an explicit hand-off here. Miss one and its endpoints return
         # "repository not initialised" for the lifetime of the process.
         set_whatsapp_dependencies(deps=deps)
-        set_org_dependencies(tenants=deps.tenants)
+        set_org_dependencies(tenants=deps.tenants, profile_repo=deps.profile_repo)
         set_repository(deps.repo)
         set_customer_dependencies(
             profile_repo=deps.customer_profile_repo,

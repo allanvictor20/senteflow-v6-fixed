@@ -69,7 +69,7 @@ backend/
 ├── bootstrap/             ← app factory + dependency wiring (per-business routers)
 ├── api/
 │   ├── routes/whatsapp.py ← webhook, queue, tenancy routing, recovery
-│   ├── routes/org.py      ← link/unlink WhatsApp numbers for a business
+│   ├── routes/org.py      ← WhatsApp numbers + business profile settings
 │   ├── routes/*.py        ← customers, orders, tasks, insights
 │   └── routes_legacy.py   ← /extract, /approve, /summary, ... (dashboard)
 ├── integrations/whatsapp/ ← Evolution client, normaliser, router, reply sender
@@ -131,6 +131,14 @@ npm start
 ```
 
 Or everything with Docker: `docker compose up` (set the variables in a root `.env`).
+
+### Business profile
+
+Dashboard → Settings → Business profile (or `GET/PUT /api/org/profile?org_id=...`).
+SenteFlow's AI reads it on every message: business name, what you sell,
+location, credit policy and free-form notes ("'bags' means 50kg cement bags").
+The default currency is used for amounts you don't label and in replies,
+reminders and the morning briefing (UGX, KES, TZS, RWF or USD).
 
 ### Linking WhatsApp numbers
 
