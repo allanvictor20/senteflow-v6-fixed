@@ -10,9 +10,13 @@ message SenteFlow; the owner tells SenteFlow about them ("Brian paid 50k").
 Text flow:
   pending question? ── approval (YES/NO) → resume / cancel the paused event
                     ── reminder follow-up (YES) → mark settled
+                    ── correction (YES/NO, or which number) → apply / leave
                     ── clarification → merge the answer and re-run
+  → "undo" / "delete that"? → correction, no AI needed
+  → language: detect, translate to English (Sunbird AI)
   → ContextEngine (owner-level context)
-  → extract_event (LLM)                         → BusinessEvent
+  → extract_event (LLM, original + translation) → BusinessEvent
+  → correction? find the record, show before/after, wait for YES
   → business_query? answer from the records and stop
   → low-confidence money event? ask BEFORE recording anything
   → resolve the customer from the message (ask if ambiguous)
@@ -114,6 +118,8 @@ class PendingStateManager:
       awaiting_clarification  — pending_context.original_text
       awaiting_approval       — pending_context.event / action / completed
       awaiting_reminder_ack   — pending_context.reminder_ids
+      awaiting_correction     — pending_context.plan (see services/corrections)
+      awaiting_correction_choice — pending_context.choices / action / changes
     """
 
     def __init__(self, repo, org_id: str):
@@ -160,6 +166,9 @@ class PendingStateManager:
             {"event": event_data, "action": action, "completed": list(completed)},
             question,
         )
+
+    async def set_pending(self, sender_id: str, intent: str, context: dict, question: str) -> None:
+        await self._set(sender_id, intent, context, question)
 
     async def set_pending_reminder_ack(self, sender_id: str, reminder_ids: list[str], question: str) -> None:
         await self._set(sender_id, "awaiting_reminder_ack", {"reminder_ids": list(reminder_ids)}, question)
@@ -220,6 +229,9 @@ class MessageRouter:
         # One manager per router, not per message: its in-memory fallback cache
         # is useless if a fresh instance is constructed on every turn.
         self.pending_mgr = PendingStateManager(repo, org_id)
+        # Language each owner last wrote in (ISO 639-3) — used to translate
+        # replies when the business asked for replies in the owner's language.
+        self._owner_language: dict[str, str] = {}
 
     async def route(self, event: MessageEvent) -> None:
         logger.info(
@@ -262,6 +274,12 @@ class MessageRouter:
         elif intent == "awaiting_reminder_ack":
             if await self._handle_reminder_ack(event, pending):
                 return
+        elif intent == "awaiting_correction":
+            if await self._handle_correction_reply(event, pending):
+                return
+        elif intent == "awaiting_correction_choice":
+            if await self._handle_correction_choice(event, pending):
+                return
         elif intent == "awaiting_clarification":
             original_text = (pending.get("pending_context") or {}).get("original_text", "")
             merged_text = f"{original_text} — {event.text}" if original_text else event.text
@@ -295,8 +313,11 @@ class MessageRouter:
             return
 
         try:
+            settings = await self._settings()
             audio_bytes = await asyncio.to_thread(_read_bytes, file_path)
-            utterances = await transcribe_voice_note(audio_bytes, event.media_mime_type)
+            utterances = await transcribe_voice_note(
+                audio_bytes, event.media_mime_type, language=settings["language"]
+            )
         except Exception as exc:
             logger.error("voice_transcription_failed", extra={"error": str(exc)})
             utterances = []
@@ -314,7 +335,16 @@ class MessageRouter:
         from services.memory.context_engine import ContextEngine
         from domain.events.event_types import EventType
 
+        from services.corrections import is_undo_command
+
         try:
+            # "undo" / "delete that" needs no AI (and works when it's down).
+            if not already_clarified and is_undo_command(event.text or ""):
+                await self._start_correction(event, "undo", {}, {})
+                return
+
+            translation = await self._normalize_language(event)
+
             # Owner-level context; the customer isn't known until extraction.
             context_engine = ContextEngine(repo=self.repo, org_id=self.org_id, mem_repo=self.mem_repo)
             context = await context_engine.get_context(
@@ -339,6 +369,7 @@ class MessageRouter:
                 business_id=self.org_id,
                 context=context,
                 profile_repo=self.profile_repo,
+                translation=translation,
             )
             # Amounts without a currency use the business's default currency
             # (Settings → Business profile), not a hard-coded UGX.
@@ -353,6 +384,15 @@ class MessageRouter:
                     "sender": event.sender_id,
                 },
             )
+
+            # ── "That's wrong" — fix something already recorded ───────────────
+            if business_event.event_type == EventType.CORRECTION:
+                from services.corrections import changes_from, correction_action
+                entities = business_event.entities or {}
+                await self._start_correction(
+                    event, correction_action(entities), entities, changes_from(entities)
+                )
+                return
 
             # ── Questions about the owner's own records ───────────────────────
             if business_event.event_type == EventType.BUSINESS_QUERY:
@@ -552,6 +592,127 @@ class MessageRouter:
         await self._reply(event, "\n".join(lines))
         return True
 
+    # ── Corrections ───────────────────────────────────────────────────────────
+
+    def _corrections(self):
+        from services.corrections import CorrectionService
+        return CorrectionService(self.repo, self.org_id, dispatch=self._dispatch)
+
+    async def _start_correction(self, event: MessageEvent, action: str, hints: dict, changes: dict) -> None:
+        """Find the record the owner wants fixed and ask them to confirm."""
+        from services.corrections import CHOICES_SHOWN, choice_question, describe, find_matches
+
+        svc = self._corrections()
+        try:
+            records = await asyncio.to_thread(svc.recent_records)
+        except Exception as exc:
+            logger.error("correction_records_failed", extra={"error": str(exc)})
+            await self._reply(event, "⚠️ I couldn't look up your records just now. Please try again.")
+            return
+        if not records:
+            await self._reply(event, "I couldn't find any recent records to change.")
+            return
+
+        note = event.text or ""
+        matches = find_matches(records, hints, event.sender_id)
+
+        if action == "change" and not changes:
+            last = (matches or records)[0]
+            await self._reply(
+                event,
+                "What should it say instead? Tell me the right amount, name or date — "
+                "e.g. \"it was 40k\" or \"it was Kato, not Brian\". Or say *undo* to remove it:\n"
+                f"• {describe(last)}",
+            )
+            return
+
+        if changes.get("customer"):
+            customer_id, name, question = await asyncio.to_thread(svc.resolve_new_customer, changes["customer"])
+            if question:
+                await self._reply(event, question)
+                return
+            changes = {**changes, "customer": name, "customer_id": customer_id}
+
+        if not matches:
+            choices = records[:CHOICES_SHOWN]
+            question = choice_question(choices, "I couldn't find that record. Which one do you mean?")
+            await self.pending_mgr.set_pending(
+                event.sender_id,
+                "awaiting_correction_choice",
+                {"choices": [r.to_dict() for r in choices], "action": action, "changes": changes, "note": note},
+                question,
+            )
+            await self._reply(event, question)
+            return
+
+        await self._confirm_correction(event, action, matches[0], changes, note, other_matches=len(matches) - 1)
+
+    async def _confirm_correction(self, event, action, target, changes, note, other_matches=0) -> None:
+        from services.corrections import confirm_question, new_plan, validate_change
+
+        if action == "change":
+            problem = validate_change(target, changes)
+            if problem:
+                await self._reply(event, problem)
+                return
+        plan = new_plan(action, target, changes, note, other_matches=other_matches)
+        question = confirm_question(plan)
+        await self.pending_mgr.set_pending(event.sender_id, "awaiting_correction", {"plan": plan}, question)
+        await self._reply(event, question)
+        await self._remember(event, "correction_requested", {"action": action, "target": target.id})
+
+    async def _handle_correction_reply(self, event: MessageEvent, pending: dict) -> bool:
+        """Owner answered "fix/remove this record?". Returns True if handled."""
+        answer = _yes_no(event.text or "")
+        plan = (pending.get("pending_context") or {}).get("plan") or {}
+        await self.pending_mgr.clear_pending(event.sender_id)
+        if answer is None:
+            await self._reply(event, "ℹ️ I left that record as it was.")
+            return False
+        if answer is False or not plan:
+            await self._reply(event, "👍 Okay, I left it as it was.")
+            return True
+
+        approver = f"whatsapp:{event.sender_id.split('@')[0]}"
+        try:
+            reply, _affected, _new_event = await self._corrections().apply(plan, approver)
+        except Exception as exc:
+            logger.error("correction_apply_failed", extra={"error": str(exc)})
+            await self._reply(event, "⚠️ I couldn't make that change just now. Please try again.")
+            return True
+        await self._reply(event, reply)
+        await self._remember(event, "correction_applied", {"action": plan.get("action"), "target": (plan.get("target") or {}).get("id")})
+        return True
+
+    async def _handle_correction_choice(self, event: MessageEvent, pending: dict) -> bool:
+        """Owner picked which record to fix from a numbered list."""
+        from services.corrections import Record
+
+        ctx = pending.get("pending_context") or {}
+        choices = [Record.from_dict(c) for c in ctx.get("choices") or []]
+        text = (event.text or "").strip()
+        await self.pending_mgr.clear_pending(event.sender_id)
+
+        answer = _yes_no(text)
+        if answer is False:
+            await self._reply(event, "👍 Okay, nothing changed.")
+            return True
+        if answer is True and choices:
+            # "yes" isn't a pick — ask again for the number.
+            question = f"Which one? Reply with a number from 1 to {len(choices)}, or *NO* to leave everything as it is."
+            await self.pending_mgr.set_pending(event.sender_id, "awaiting_correction_choice", ctx, question)
+            await self._reply(event, question)
+            return True
+        match =re.fullmatch(r"\s*(?:no\.?\s*|number\s*|#)?(\d{1,2})\s*[.)]?\s*", text, re.IGNORECASE)
+        if not match or not (1 <= int(match.group(1)) <= len(choices)):
+            await self._reply(event, "ℹ️ I didn't change anything.")
+            return False
+        target = choices[int(match.group(1)) - 1]
+        await self._confirm_correction(
+            event, ctx.get("action") or "change", target, ctx.get("changes") or {}, ctx.get("note") or ""
+        )
+        return True
+
     # ── Owner questions ───────────────────────────────────────────────────────
 
     async def _answer_query(self, event: MessageEvent, business_event) -> None:
@@ -596,7 +757,8 @@ class MessageRouter:
                 "• ✍️ Tell me what happened: \"Brian paid 50k for feed\"\n"
                 "• 📸 Send a receipt or MoMo screenshot → I'll record it\n"
                 "• 🎤 Send a voice note → I'll transcribe and record it\n"
-                "• 📊 Ask \"summary\" or \"who owes me?\"",
+                "• 📊 Ask \"summary\" or \"who owes me?\"\n"
+                "• ✏️ Fix a mistake: \"undo\" or \"Brian paid 40k not 50k\"",
             )
             return True
 
@@ -624,7 +786,11 @@ class MessageRouter:
                 "*Ask:*\n"
                 "• \"summary\" — financial overview\n"
                 "• \"recent\" — last 10 transactions\n"
-                "• \"who owes me?\" or \"how much does Brian owe?\"",
+                "• \"who owes me?\" or \"how much does Brian owe?\"\n\n"
+                "*Fix a mistake:*\n"
+                "• \"undo\" — remove the last thing you recorded\n"
+                "• \"Brian paid 40k not 50k\"\n"
+                "• \"it was Kato, not Brian\"",
             )
             return True
 
@@ -783,13 +949,45 @@ class MessageRouter:
     # ── Reply / memory helpers ────────────────────────────────────────────────
 
     async def _currency(self) -> str:
-        from services.business_settings import business_currency
-        return await business_currency(self.profile_repo, self.org_id)
+        return (await self._settings())["currency"]
+
+    async def _settings(self) -> dict:
+        from services.business_settings import business_settings
+        return await business_settings(self.profile_repo, self.org_id)
+
+    async def _normalize_language(self, event: MessageEvent) -> Optional[dict]:
+        """Detect the message language and translate it to English (Sunbird AI)."""
+        from services.llm.language_pipeline import normalize_business_text
+        try:
+            translation = await normalize_business_text(event.text or "")
+        except Exception as exc:
+            logger.warning("language_normalization_failed", extra={"error": str(exc)})
+            return None
+        self._owner_language[event.sender_id] = translation.get("language") or "eng"
+        return translation
+
+    async def _localize(self, event: MessageEvent, text: str) -> tuple[str, bool]:
+        """The reply in the owner's language when the business asked for that."""
+        language = self._owner_language.get(event.sender_id)
+        if not text or not language or language == "eng":
+            return text, False
+        try:
+            if (await self._settings())["reply_language"] != "same":
+                return text, False
+            from services.llm.language_pipeline import translate_reply
+            translated = await translate_reply(text, language)
+        except Exception as exc:
+            logger.warning("reply_translation_failed", extra={"error": str(exc)})
+            return text, False
+        return (translated, True) if translated else (text, False)
 
     async def _reply(self, event: MessageEvent, text: str) -> None:
         # Voice-aware reply: if the owner sent a voice note, answer with one
-        # (ElevenLabs), falling back to text automatically.
-        inbound_was_voice = event.message_type in (MessageType.VOICE, MessageType.AUDIO)
+        # (ElevenLabs), falling back to text automatically. Translated replies
+        # go as text — ElevenLabs voices don't speak Luganda and the other
+        # local languages well.
+        text, translated = await self._localize(event, text)
+        inbound_was_voice = event.message_type in (MessageType.VOICE, MessageType.AUDIO) and not translated
         try:
             from integrations.whatsapp.reply_sender import send_voice_aware
             await send_voice_aware(

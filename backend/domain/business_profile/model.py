@@ -31,6 +31,12 @@ class BusinessProfile(BaseModel):
     owner_phone: str = ""
     currency: str = "UGX"
     notes: str = ""
+    # Main language the owner speaks (ISO 639-3). Voice notes are transcribed
+    # in this language (Sunbird AI); text messages are detected per message.
+    language: str = "lug"
+    # "english" = always reply in English; "same" = reply in the language the
+    # owner wrote in (translated by Sunbird AI).
+    reply_language: str = "english"
 
     def to_system_prompt_section(self) -> str:
         lines: list[str] = []
@@ -55,6 +61,9 @@ class BusinessProfile(BaseModel):
                 lines.append("Default item ('the usual'): " + ", ".join(p.display() for p in default))
             if others:
                 lines.append("Other products: " + ", ".join(p.display() for p in others[:8]))
+        if self.language and self.language != "eng":
+            from services.llm.sunbird import LANGUAGE_NAMES
+            lines.append(f"Owner usually speaks: {LANGUAGE_NAMES.get(self.language, self.language)}")
         if self.notes:
             lines.append(f"Owner notes: {self.notes}")
         if not lines:

@@ -737,8 +737,19 @@ class TransactionRepository:
                     results.append({**data, "id": d.id, "_collection": collection})
         return results
 
-    def resolve_commitments(self, org_id: str, items: list[dict], resolved_by: str = "") -> int:
-        """Mark promises/reminders as resolved. Returns how many were updated."""
+    def resolve_commitments(
+        self,
+        org_id: str,
+        items: list[dict],
+        resolved_by: str = "",
+        resolved_by_event: Optional[str] = None,
+    ) -> int:
+        """
+        Mark promises/reminders as resolved. Returns how many were updated.
+
+        resolved_by_event is the payment that closed them; undoing that
+        payment (corrections over WhatsApp) reopens them via reopen_commitments.
+        """
         now = utc_now().isoformat()
         count = 0
         for item in items:
@@ -746,16 +757,48 @@ class TransactionRepository:
             doc_id = item.get("id")
             if not collection or not doc_id:
                 continue
+            update = {
+                "status": "resolved",
+                "resolved_at": now,
+                "resolved_by": resolved_by,
+                "reopen_status": item.get("status") or "pending",
+            }
+            if resolved_by_event:
+                update["resolved_by_event"] = resolved_by_event
             try:
-                self._col(org_id, collection).document(doc_id).update({
-                    "status": "resolved",
-                    "resolved_at": now,
-                    "resolved_by": resolved_by,
-                })
+                self._col(org_id, collection).document(doc_id).update(update)
                 count += 1
             except Exception as exc:
                 logger.warning("commitment_resolve_failed", extra={"id": doc_id, "error": str(exc)})
         return count
+
+    def reopen_commitments(self, org_id: str, event_id: str) -> list[dict]:
+        """Reopen the promises/reminders a (now undone) payment had closed."""
+        reopened: list[dict] = []
+        if not event_id:
+            return reopened
+        for collection in ("promises", "reminders"):
+            try:
+                docs = self._col(org_id, collection).where("resolved_by_event", "==", event_id).get()
+            except Exception as exc:
+                logger.warning("reopen_commitments_query_failed", extra={"collection": collection, "error": str(exc)})
+                continue
+            for d in docs:
+                data = d.to_dict() or {}
+                if data.get("status") != "resolved":
+                    continue
+                try:
+                    d.reference.update({
+                        "status": data.get("reopen_status") or "pending",
+                        "resolved_at": None,
+                        "resolved_by": None,
+                        "resolved_by_event": None,
+                        "reopened_at": utc_now().isoformat(),
+                    })
+                    reopened.append({**data, "id": d.id, "_collection": collection})
+                except Exception as exc:
+                    logger.warning("commitment_reopen_failed", extra={"id": d.id, "error": str(exc)})
+        return reopened
 
     def list_open_promises(self, org_id: str, limit: int = 500) -> list[dict]:
         try:

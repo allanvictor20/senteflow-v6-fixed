@@ -185,6 +185,9 @@ export function TxnRow({ t, orgId }) {
             <span>{t.category}</span>
             {t.payer && <span>· {t.payer}</span>}
             {t.date && <span>· {t.date}</span>}
+            {(t.corrects || (t.corrections && t.corrections.length > 0)) && (
+              <span title="Corrected by the owner over WhatsApp">· ✏️ corrected</span>
+            )}
             {t.confidence_overall && (
               <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
                 · <ConfidenceDot color={confColor} size={6} /> {t.confidence_overall}

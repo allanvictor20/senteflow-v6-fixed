@@ -411,11 +411,27 @@ async def _transcribe_with_groq_whisper(audio_bytes: bytes, mime_type: Optional[
 async def transcribe_audio_bytes(
     audio_bytes: bytes,
     mime_type: Optional[str] = None,
+    language: Optional[str] = None,
 ) -> str:
     """
-    Transcribe a single in-memory audio blob. Tries Deepgram first, falls
-    back to Groq Whisper if Deepgram fails or is unconfigured.
+    Transcribe a single in-memory audio blob.
+
+    language (ISO 639-3, e.g. "lug"): the language the business speaks
+    (Settings → Business profile). For anything but English, Sunbird AI is
+    tried first when SUNBIRD_API_KEY is set — Deepgram and Whisper are weak
+    on Luganda and other Ugandan languages. Then Deepgram, then Groq Whisper.
     """
+    from services.llm import sunbird
+
+    if language and language != "eng" and sunbird.is_configured():
+        try:
+            text = await sunbird.transcribe(audio_bytes, mime_type, language)
+            if text:
+                return text
+            logger.warning("sunbird_empty_transcript_falling_back", extra={"language": language})
+        except sunbird.SunbirdError as exc:
+            logger.warning("sunbird_transcribe_failed", extra={"error": str(exc), "language": language})
+
     if os.environ.get("DEEPGRAM_API_KEY"):
         try:
             text = await _transcribe_with_deepgram(audio_bytes, mime_type)
@@ -436,6 +452,7 @@ async def transcribe_audio_bytes(
 async def transcribe_segments(
     segments: list[VoiceSegment],
     mime_type: Optional[str] = None,
+    language: Optional[str] = None,
 ) -> list[VoiceSegment]:
     """
     Transcribe each VoiceSegment in parallel using Deepgram (with Whisper
@@ -446,7 +463,7 @@ async def transcribe_segments(
         return segments
 
     async def _one(seg: VoiceSegment) -> str:
-        return await transcribe_audio_bytes(seg.audio_bytes, "audio/wav")
+        return await transcribe_audio_bytes(seg.audio_bytes, "audio/wav", language=language)
 
     transcripts = await asyncio.gather(*[_one(s) for s in segments])
     for seg, txt in zip(segments, transcripts):
@@ -454,7 +471,11 @@ async def transcribe_segments(
     return segments
 
 
-async def transcribe_voice_note(audio_bytes: bytes, mime_type: Optional[str]) -> list[str]:
+async def transcribe_voice_note(
+    audio_bytes: bytes,
+    mime_type: Optional[str],
+    language: Optional[str] = None,
+) -> list[str]:
     """
     Transcribe a WhatsApp voice note into one or more utterances.
 
@@ -468,11 +489,11 @@ async def transcribe_voice_note(audio_bytes: bytes, mime_type: Optional[str]) ->
     if duration > _LONG_AUDIO_THRESHOLD_SECONDS:
         segments = await asyncio.to_thread(segment_voice_memo, audio_bytes, mime_type)
         if segments:
-            segments = await transcribe_segments(segments, mime_type)
+            segments = await transcribe_segments(segments, mime_type, language=language)
             texts = [s.transcript.strip() for s in segments if s.transcript and s.transcript.strip()]
             if texts:
                 return texts
-    text = (await transcribe_audio_bytes(audio_bytes, mime_type)).strip()
+    text = (await transcribe_audio_bytes(audio_bytes, mime_type, language=language)).strip()
     return [text] if text else []
 
 

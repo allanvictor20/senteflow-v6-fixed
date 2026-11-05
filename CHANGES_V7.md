@@ -130,3 +130,65 @@ payloads through the whole app against an in-memory Firestore.
 4. Firestore may ask for composite indexes on first use (the link in the error creates them).
 5. Old `customers` documents keyed by a WhatsApp id (`…@s.whatsapp.net`) were
    written by the v6 bug; they are ignored and can be deleted.
+
+---
+
+# 7.1 — Corrections over WhatsApp, and Ugandan languages with Sunbird AI
+
+## Fixing mistakes from the chat
+
+The owner can now fix anything SenteFlow recorded without leaving WhatsApp:
+
+| Owner says | What happens |
+|---|---|
+| `undo` / `delete that` / `sazaamu` | Shows the last record, asks YES/NO, removes it |
+| `Brian paid 40k not 50k` | Before/after, YES → amount fixed |
+| `it was Kato, not Brian` | Moves the record to Kato (asks "which Kato?" if ambiguous) |
+| `Brian will pay Monday not Friday` | Promise and reminder move to the new date |
+| `that was an expense, not a payment` | Changes the record type |
+| `remove Peter's payment` (no match) | Numbered list of recent records → "reply with the number" |
+
+- Nothing changes without a YES, and nothing is deleted: undone ledger entries
+  get `status: "rejected"` with `rejected_by` / `rejected_at`; promises,
+  reminders, alerts and orders get `status: "cancelled"`; edited receipt
+  entries keep a `corrections` history.
+- A record made from a WhatsApp message is corrected by reverting everything
+  that message did and dispatching a corrected copy through the normal tools,
+  so balances, reminders and closed promises come out as if it had been
+  right the first time. Undoing a payment that settled a debt reopens the
+  promise/reminder it closed (`resolved_by_event` is now stored on them).
+- Customer running totals (memory, profiles) are recomputed from the ledger
+  after a correction.
+- The dashboard hides rejected entries (it lists approved ones) and marks
+  corrected entries "✏️ corrected".
+- Code: `backend/services/corrections.py`, router `_start_correction` /
+  `_handle_correction_reply` / `_handle_correction_choice`, new event type
+  `correction`. Tests: `tests/test_corrections.py`.
+
+## Languages (Sunbird AI)
+
+- `services/llm/sunbird.py`: client for Sunbird's current API
+  (`/tasks/language_id`, `/tasks/translate`, `/tasks/audio/transcriptions`).
+- Every text message: language detected (keywords, then Sunbird), translated
+  to English when it isn't English, and the AI is given **both** the original
+  and the translation, with instructions to trust the original for names and
+  amounts. The event stores `language` and `translated_text`.
+- Voice notes are transcribed by Sunbird in the business's language
+  (Settings → "Language you speak", default Luganda); Deepgram/Whisper remain
+  the fallback and the path for English.
+- Optional replies in the owner's language (Settings → Replies → "In the
+  language I write in"). A translated reply is only sent if every number in
+  it survives translation; otherwise the English reply goes out. Translated
+  replies are sent as text (ElevenLabs voices don't speak Luganda well).
+- The old v5 Sunbird call used an endpoint shape that no longer exists and was
+  never called; it is replaced. "balance", "aha", "leo" and a few other
+  English-looking words were removed from the keyword lists.
+- Tests: `tests/test_sunbird_language.py` (HTTP mocked).
+
+## Upgrading
+
+1. Set `SUNBIRD_API_KEY` (an access token from `POST https://api.sunbird.ai/auth/token`).
+   `SUNBIRD_API_URL` is now the base URL (default `https://api.sunbird.ai`) —
+   remove any old value that ends in a path.
+2. Set each business's language in Settings → Business profile (default Luganda).
+3. Redeploy the backend; no Firestore index or rules changes are needed.

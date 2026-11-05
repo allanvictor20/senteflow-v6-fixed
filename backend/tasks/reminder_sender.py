@@ -23,6 +23,7 @@ per business) and piggybacked on owner messages (message_router).
 """
 
 import asyncio
+import uuid
 import logging
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Optional
@@ -272,12 +273,22 @@ async def mark_reminders_settled(repo, org_id: str, reminder_ids: list[str], own
             continue
 
         now = utc_now().isoformat()
-        update = {"status": "resolved", "resolved_at": now, "resolved_by": f"whatsapp:{owner_id.split('@')[0]}"}
+        # The payment recorded below gets this id, so undoing that payment
+        # over WhatsApp reopens the reminder and promise it closed.
+        payment_event_id = str(uuid.uuid4())
+        update = {
+            "status": "resolved",
+            "resolved_at": now,
+            "resolved_by": f"whatsapp:{owner_id.split('@')[0]}",
+            "resolved_by_event": payment_event_id,
+        }
         try:
-            await asyncio.to_thread(snap.reference.update, update)
+            await asyncio.to_thread(
+                snap.reference.update, {**update, "reopen_status": reminder.get("status") or "pending"}
+            )
             promise = await asyncio.to_thread(promises_col.document(reminder_id).get)
             if promise.exists and (promise.to_dict() or {}).get("status") == "pending":
-                await asyncio.to_thread(promise.reference.update, update)
+                await asyncio.to_thread(promise.reference.update, {**update, "reopen_status": "pending"})
         except Exception as exc:
             logger.warning("reminder_settle_failed", extra={"id": reminder_id, "error": str(exc)})
             continue
@@ -291,6 +302,7 @@ async def mark_reminders_settled(repo, org_id: str, reminder_ids: list[str], own
             amount = outstanding if outstanding > 0.5 else None
         if reminder.get("kind", "payment") == "payment" and isinstance(amount, (int, float)) and amount > 0:
             payment = BusinessEvent(
+                event_id=payment_event_id,
                 event_type=EventType.PAYMENT_RECEIVED,
                 raw_message=f"Settled via reminder: {reminder.get('raw_message') or ''}"[:200],
                 sender_id=owner_id,

@@ -71,7 +71,7 @@ assistant_router = APIRouter()
 
 @health_router.get("/health")
 def health():
-    return {"status": "ok", "service": "SenteFlow AI", "version": "7.0.0"}
+    return {"status": "ok", "service": "SenteFlow AI", "version": "7.1.0"}
 
 
 # ─── Extract ──────────────────────────────────────────────────────────────────

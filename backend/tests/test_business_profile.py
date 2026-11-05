@@ -41,7 +41,7 @@ async def _fake_llm(message, context, org_id="default", profile_repo=None):
 def app_env(monkeypatch):
     monkeypatch.setenv("ENVIRONMENT", "development")
     monkeypatch.setenv("OWNER_PHONES", f"+{OWNER}")
-    for var in ("WEBHOOK_SECRET", "EVOLUTION_API_KEY", "EVOLUTION_API_TOKEN", "DEFAULT_OWNER_PHONE"):
+    for var in ("WEBHOOK_SECRET", "EVOLUTION_API_KEY", "EVOLUTION_API_TOKEN", "DEFAULT_OWNER_PHONE", "SUNBIRD_API_KEY"):
         monkeypatch.delenv(var, raising=False)
 
     from bootstrap.dependency_injection import build_dependencies
@@ -115,3 +115,16 @@ def test_business_currency_used_in_whatsapp_replies(app_env):
 
     client.post("/api/webhooks/whatsapp", json=_webhook("who owes me?", "M2"))
     assert "Wanjiru: KES 3,000" in wa.sent[-1][1]
+
+
+def test_language_settings(app_env):
+    client, db, wa = app_env
+    body = client.get("/api/org/profile", params={"org_id": "org-1"}).json()
+    assert body["language"] == "lug" and body["reply_language"] == "english"
+
+    r = client.put("/api/org/profile", params={"org_id": "org-1"}, json={"language": "SWA", "reply_language": "Same"})
+    assert r.status_code == 200
+    assert r.json()["language"] == "swa" and r.json()["reply_language"] == "same"
+
+    assert client.put("/api/org/profile", params={"org_id": "org-1"}, json={"language": "french"}).status_code == 400
+    assert client.put("/api/org/profile", params={"org_id": "org-1"}, json={"reply_language": "luganda"}).status_code == 400
