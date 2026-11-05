@@ -46,6 +46,10 @@ class BusinessEvent(BaseModel):
 
     # Source
     raw_message: str = ""
+    # Language the owner wrote in (ISO 639-3, e.g. "lug") and the English
+    # translation the AI read alongside the original, when there was one.
+    language: Optional[str] = None
+    translated_text: Optional[str] = None
     source_type: str = "whatsapp"   # whatsapp | api | upload
     sender_id: str = ""
     business_id: str = ""

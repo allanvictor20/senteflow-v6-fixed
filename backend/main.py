@@ -40,7 +40,7 @@ from bootstrap.app_factory import create_app
 from bootstrap.dependency_injection import build_dependencies
 from core.errors import StructuredLogger
 
-APP_VERSION = "7.0.0"
+APP_VERSION = "7.1.0"
 
 logging.basicConfig(
     level=logging.INFO,

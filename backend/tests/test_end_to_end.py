@@ -77,7 +77,7 @@ async def _fake_llm(message, context, org_id="default", profile_repo=None):
 def system(monkeypatch):
     monkeypatch.setenv("ENVIRONMENT", "development")
     monkeypatch.setenv("OWNER_PHONES", f"+{OWNER}")
-    for var in ("WEBHOOK_SECRET", "EVOLUTION_API_KEY", "EVOLUTION_API_TOKEN", "DEFAULT_OWNER_PHONE"):
+    for var in ("WEBHOOK_SECRET", "EVOLUTION_API_KEY", "EVOLUTION_API_TOKEN", "DEFAULT_OWNER_PHONE", "SUNBIRD_API_KEY"):
         monkeypatch.delenv(var, raising=False)
 
     from bootstrap.dependency_injection import build_dependencies

@@ -290,7 +290,9 @@ class ReduceDebtTool(ToolBase):
         if not to_resolve:
             return ToolResult(outcome="reduce_debt:nothing_to_close")
         resolver = getattr(repo, "resolve_commitments", None)
-        count = await _maybe_await(resolver(org_id, to_resolve, _whatsapp_approver(event))) if resolver else 0
+        count = await _maybe_await(
+            resolver(org_id, to_resolve, _whatsapp_approver(event), resolved_by_event=event.event_id)
+        ) if resolver else 0
         event.entities["_debts_cleared"] = count
         return ToolResult(outcome=f"reduce_debt:ok:{count}")
 

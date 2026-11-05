@@ -1,4 +1,4 @@
-# SenteFlow AI — v7
+# SenteFlow AI — v7.1
 
 **WhatsApp-native AI business memory assistant for small businesses in East Africa.**
 
@@ -14,6 +14,8 @@ The owner (or their staff) messages SenteFlow:
 - "Brian paid 50k" → payment recorded; Brian now owes 100k
 - A MoMo screenshot or receipt photo → transactions extracted and recorded
 - A voice note (English, Luganda, Swahili, mixed) → transcribed and handled like a text
+- A message in Luganda, Runyankole, Acholi, Swahili, ... → translated by Sunbird AI; the AI reads both the original and the translation
+- "undo" / "Brian paid 40k not 50k" / "it was Kato, not Brian" → shows the record before and after, fixes it on YES
 - "Who owes me money?" / "How much does Brian owe?" / "summary" → answered from the records
 - Every morning at 7am → a briefing: overdue promises, low stock, quiet customers, revenue trend
 
@@ -29,7 +31,7 @@ Customers never message SenteFlow. **The sender is always the owner; the custome
 sale · expense · payment_received · payment_promise · debt_created
 order_created · customer_inquiry · negotiation · complaint
 inventory_update · low_stock_alert · supplier_message
-reminder_request · business_query
+reminder_request · business_query · correction
 ```
 
 ---
@@ -43,9 +45,13 @@ WhatsApp message to the SenteFlow number
   → which business is this number linked to?  (services/tenancy.py)
         unknown number → "not linked" reply, no data
   → that business's MessageRouter
-      pending question?  YES/NO approval · reminder "YES" · clarification answer
+      pending question?  YES/NO approval · reminder "YES" · correction YES/NO or
+                         number · clarification answer
+      "undo" / "delete that"?       → correction (no AI needed)
+      language                      detect + translate to English (Sunbird AI)
       ContextEngine                 owner-level context
-      EventExtractor (LLM)          message → BusinessEvent
+      EventExtractor (LLM)          original + translation → BusinessEvent
+      correction?                   find the record, before/after, wait for YES
       business_query?               answer from the ledger, stop
       unsure about money?           ask BEFORE recording
       CustomerResolver              "Brian" → which customer (asks if ambiguous)
@@ -75,11 +81,13 @@ backend/
 ├── integrations/whatsapp/ ← Evolution client, normaliser, router, reply sender
 ├── services/
 │   ├── tenancy.py         ← phone number → business
-│   ├── llm/               ← provider chain, models, extractor, media/voice
+│   ├── llm/               ← provider chain, models, extractor, media/voice,
+│   │                         sunbird.py + language_pipeline.py (languages)
 │   ├── actions/           ← ActionDispatcher + tools
 │   ├── conversation/      ← customer resolution, state machine, entity links
 │   ├── memory/            ← context engine, customer memory, insights
 │   ├── responses/         ← WhatsApp reply text, ledger balances
+│   ├── corrections.py     ← "undo" / "Brian paid 40k not 50k" over WhatsApp
 │   └── ledger.py          ← saving extracted transactions
 ├── tasks/                 ← reminder_sender.py, briefing.py
 ├── repositories/          ← Firestore persistence
@@ -139,6 +147,23 @@ SenteFlow's AI reads it on every message: business name, what you sell,
 location, credit policy and free-form notes ("'bags' means 50kg cement bags").
 The default currency is used for amounts you don't label and in replies,
 reminders and the morning briefing (UGX, KES, TZS, RWF or USD).
+"Language you speak" is the language voice notes are transcribed in, and
+"Replies" chooses English or the language the owner writes in.
+
+### Fixing mistakes
+
+Everything is fixed from the chat, always with a before/after and a YES:
+
+```
+undo                                  remove the last record
+Brian paid 40k not 50k                change the amount
+it was Kato, not Brian                change the customer
+Brian will pay Monday not Friday      move the promise and its reminder
+that was an expense, not a payment    change the type
+```
+
+Nothing is deleted — undone entries are marked rejected/cancelled with who
+did it and when, and edited receipt entries keep a `corrections` history.
 
 ### Linking WhatsApp numbers
 
@@ -164,7 +189,9 @@ EVOLUTION_API_URL, EVOLUTION_API_TOKEN, EVOLUTION_INSTANCE_NAME
 GOOGLE_APPLICATION_CREDENTIALS, DEFAULT_ORG_ID
 OWNER_PHONES                  numbers allowed for the default business
 BUSINESS_TZ (Africa/Kampala), BRIEFING_HOUR (7)
-DEEPGRAM_API_KEY              optional — voice notes (falls back to Groq Whisper)
+SUNBIRD_API_KEY               recommended — Ugandan languages: detection,
+                              translation, Luganda voice notes (Sunbird AI)
+DEEPGRAM_API_KEY              optional — English voice notes (falls back to Groq Whisper)
 ELEVENLABS_API_KEY            optional — voice-note replies (falls back to text)
 SENTRY_DSN                    optional
 ENVIRONMENT                   production (default) enforces auth + webhook checks
@@ -185,16 +212,19 @@ cd backend && python -m pytest -q
 ```
 Owner sends a voice note
   → decrypted download via Evolution (getBase64FromMediaMessage)
-  → transcription: Deepgram (if configured) → Groq Whisper fallback
+  → transcription: Sunbird AI in the business's language (Luganda by default)
+     → Deepgram → Groq Whisper fallback (English goes straight to Deepgram)
      long notes (>30s) are split into utterances with Silero VAD
   → each utterance goes through the normal text flow
      (so voice can record debts, ask "who owes me?", answer YES, ...)
   → reply as a voice note via ElevenLabs (if configured), else text
+     (replies translated into a local language are sent as text)
 ```
 
 ---
 
 ## Migration notes
 
+- v7.1: corrections over WhatsApp and Sunbird AI — see the end of `CHANGES_V7.md`. Set `SUNBIRD_API_KEY`.
 - v7: see `CHANGES_V7.md`. Existing deployments: set `OWNER_PHONES`, clear any retired `GROQ_*` model names from `.env`, and redeploy `firestore.rules`.
 - v3 → v4: see `docs/migration_v3_to_v4.md`.

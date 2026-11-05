@@ -26,7 +26,7 @@ def create_app(deps=None) -> FastAPI:
     app = FastAPI(
         title="SenteFlow AI",
         description="WhatsApp-native AI business memory assistant for SMEs",
-        version="7.0.0",
+        version="7.1.0",
     )
 
     # CORS: read from ALLOWED_ORIGINS env var (comma-separated).

@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 _NUMERIC_ENTITY_KEYS = frozenset({
     "amount", "quantity", "balance", "price", "total",
     "unit_price", "outstanding", "paid", "owed",
+    "target_amount", "new_amount",
 })
 
 
@@ -110,7 +111,7 @@ _USER_PROMPT_TEMPLATE = """Today is {today} ({weekday}) in Uganda.
 
 Extract the business event from this WhatsApp message from the business owner.
 
-Message: "{message}"
+{message_section}
 
 {memory_section}{business_context_section}Full context:
 {context_str}
@@ -120,14 +121,27 @@ Return a JSON object with:
   complaint, appointment_request, payment_received, payment_promise, debt_created,
   expense_recorded, delivery_update, inventory_update, low_stock_alert,
   supplier_message, business_note, follow_up_required, reminder_request,
-  business_query, unknown
+  business_query, correction, unknown
   (use business_query when the owner is ASKING about their records, e.g.
   "who owes me?", "how much did Brian pay?", "send me a summary")
+  (use correction when the owner says something ALREADY RECORDED is wrong or
+  should be removed, e.g. "undo", "delete the last one", "Brian paid 40k not
+  50k", "it was Kato not Brian", "Brian will pay Monday not Friday", "that
+  was an expense, not a payment")
 - confidence: 0.0–1.0
 - entities: relevant key-value facts (amount as a plain number, customer, payer,
   debtor, item, quantity, due_date as YYYY-MM-DD, phone, etc.). For business_query
   also set "query_type" to one of summary, recent, debts, customer_balance and,
   for customer_balance, "customer".
+  For correction set "correction_action" to "undo" (remove the record) or
+  "change" (fix it). Describe the record being corrected with only what the
+  owner said: "target_customer", "target_amount", "target_type" (one of
+  payment, debt, expense, promise, order, stock). For "change" give the new
+  values: "new_amount", "new_customer", "new_due_date" (YYYY-MM-DD),
+  "new_type" (payment, debt, expense or promise), "new_item".
+  Example: "Brian paid 40k not 50k" → correction_action "change",
+  target_customer "Brian", target_type "payment", target_amount 50000,
+  new_amount 40000.
 - reasoning: one sentence explaining your classification
 - recommended_actions: list of action keys you think apply (informational only)
 - operational_effects: human-readable list of what should happen
@@ -229,6 +243,22 @@ def _build_context_str(context: dict[str, Any]) -> str:
     return text
 
 
+def _build_message_section(message: str, translation: Optional[dict[str, Any]]) -> str:
+    """The owner's message, plus Sunbird's English translation when there is one."""
+    if translation and translation.get("translated") and translation.get("english_text"):
+        language = translation.get("language_name") or translation.get("language") or "a local language"
+        return (
+            f'Message (original, {language}): "{message}"\n'
+            f'English translation (machine translation — it may contain mistakes; '
+            f'when it disagrees with the original about names or amounts, trust the '
+            f'original): "{translation["english_text"]}"'
+        )
+    if translation and translation.get("language") not in (None, "", "eng"):
+        language = translation.get("language_name") or translation.get("language")
+        return f'Message (written in {language}; no translation available): "{message}"'
+    return f'Message: "{message}"'
+
+
 def _today_local():
     """Today's date in the business time zone (BUSINESS_TZ, default Africa/Kampala)."""
     from utils.clock import local_now
@@ -243,6 +273,7 @@ async def extract_event(
     business_id: str,
     context: Optional[dict[str, Any]] = None,
     profile_repo=None,
+    translation: Optional[dict[str, Any]] = None,
 ) -> BusinessEvent:
     """
     Main entry point: convert a raw WhatsApp message into a BusinessEvent.
@@ -253,6 +284,7 @@ async def extract_event(
         business_id:  The org/business identifier.
         context:      Enrichment dict from ContextEngine.
         profile_repo: BusinessProfileRepository — for IDEA 08 prompt injection.
+        translation:  normalize_business_text() result for non-English messages.
 
     Returns:
         A populated BusinessEvent (even on failure — type=UNKNOWN, confidence=0).
@@ -263,9 +295,14 @@ async def extract_event(
         business_id=business_id,
         context=context or {},
     )
+    if translation and translation.get("language") not in (None, "eng"):
+        event.language = translation.get("language")
+        if translation.get("translated"):
+            event.translated_text = translation.get("english_text")
 
     try:
-        extracted = await _call_llm(raw_message, context or {}, business_id, profile_repo)
+        extra = {"translation": translation} if translation and translation.get("language") not in (None, "eng") else {}
+        extracted = await _call_llm(raw_message, context or {}, business_id, profile_repo, **extra)
         _apply_extraction(event, extracted)
     except Exception as exc:
         logger.error("event_extraction_failed", extra={"error": str(exc), "raw_message": raw_message[:80]})
@@ -284,6 +321,7 @@ async def _call_llm(
     context: dict[str, Any],
     org_id: str = "default",
     profile_repo=None,
+    translation: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """
     IDEA 06: Call LLM with fallback chain instead of a hardcoded provider.
@@ -301,7 +339,7 @@ async def _call_llm(
     user_prompt = _USER_PROMPT_TEMPLATE.format(
         today=today.strftime("%Y-%m-%d"),
         weekday=today.strftime("%A"),
-        message=message,
+        message_section=_build_message_section(message, translation),
         memory_section=memory_section,
         business_context_section=business_context_section,
         context_str=context_str,

@@ -13,6 +13,7 @@ Business profile (read by the AI on every message — see BusinessProfile):
 
 GET    /api/org/profile?org_id=...
 PUT    /api/org/profile?org_id=...          any of the editable fields below
+                                            (incl. language, reply_language)
 """
 
 import asyncio
@@ -93,6 +94,8 @@ class ProfileUpdate(BaseModel):
     credit_policy: Optional[str] = Field(None, max_length=500)
     operating_hours: Optional[str] = Field(None, max_length=120)
     notes: Optional[str] = Field(None, max_length=1000)
+    language: Optional[str] = None          # ISO 639-3, see SUPPORTED_LANGUAGES
+    reply_language: Optional[str] = None    # "english" | "same"
 
 
 _PROFILE_FIELDS = tuple(ProfileUpdate.model_fields)
@@ -122,7 +125,9 @@ async def get_profile(org_id: str, _token: dict = Depends(verify_firebase_token)
 @org_router.put("/profile")
 async def update_profile(org_id: str, body: ProfileUpdate, _token: dict = Depends(verify_firebase_token)):
     from domain.business_profile.model import BusinessProfile
-    from services.business_settings import SUPPORTED_CURRENCIES, invalidate
+    from services.business_settings import (
+        REPLY_LANGUAGES, SUPPORTED_CURRENCIES, SUPPORTED_LANGUAGES, invalidate,
+    )
 
     await require_org(_token, org_id)
     repo = _require_profile_repo()
@@ -132,6 +137,14 @@ async def update_profile(org_id: str, body: ProfileUpdate, _token: dict = Depend
         updates["currency"] = updates["currency"].strip().upper()
         if updates["currency"] not in SUPPORTED_CURRENCIES:
             raise HTTPException(400, f"Currency must be one of: {', '.join(SUPPORTED_CURRENCIES)}")
+    if "language" in updates:
+        updates["language"] = updates["language"].strip().lower()
+        if updates["language"] not in SUPPORTED_LANGUAGES:
+            raise HTTPException(400, f"Language must be one of: {', '.join(SUPPORTED_LANGUAGES)}")
+    if "reply_language" in updates:
+        updates["reply_language"] = updates["reply_language"].strip().lower()
+        if updates["reply_language"] not in REPLY_LANGUAGES:
+            raise HTTPException(400, f"Reply language must be one of: {', '.join(REPLY_LANGUAGES)}")
     updates = {k: (v.strip() if isinstance(v, str) else v) for k, v in updates.items()}
 
     current = await repo.get_profile(org_id) or BusinessProfile(org_id=org_id)

@@ -1,7 +1,26 @@
 """
-SenteFlow AI — Language Pipeline (v5)
+SenteFlow AI — Language Pipeline (v8)
 ======================================
-IDEA 12 — Luganda Detection Vocabulary Gap (P2):
+Every owner message passes through normalize_business_text() before the AI
+reads it:
+
+  1. Which language?  Local keyword hints first (free, instant); otherwise
+     Sunbird's language identification when SUNBIRD_API_KEY is set.
+  2. Not English?     Sunbird translates it to English.
+  3. The extractor gets BOTH the original and the English translation, and is
+     told the translation is machine-made: names and amounts are checked
+     against the original, so a translation slip can't silently change a
+     number.
+
+translate_reply() does the reverse for owners who want replies in their own
+language (Settings → Business profile → Reply language). A translated reply is
+only used if every number in the English reply survives translation;
+otherwise the English reply is sent.
+
+Without SUNBIRD_API_KEY nothing is translated: the AI reads the original text
+(it copes with Swahili and simple Luganda, less well with longer Luganda).
+
+History (v5, IDEA 12 — Luganda detection vocabulary gap):
 
 The v4 implementation detected Luganda by checking for only 6 hardcoded words.
 Any Luganda message not containing one of those words was classified as English
@@ -17,11 +36,8 @@ Supported languages: Luganda, Runyankole, Ateso, Luo, Swahili
 """
 
 import logging
-import os
 import re
 from typing import Any
-
-import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +53,7 @@ LOCAL_LANGUAGE_HINTS = {
         "omuwendo", "obuuza", "abasuubuzi", "okulunda", "okugula", "okuuza",
         "omulimu", "obugwanjuba", "obukadde", "okuteeka", "okulaba",
         # Balance / account
-        "omubare", "balance", "ensimbi", "obulemu", "amawulire",
+        "omubare", "ensimbi", "obulemu", "amawulire",
         # Greetings and requests
         "nkuwe", "nkubuuza", "mpeereza", "nkufunire", "sirina", "yali",
         # Pronouns and connectors
@@ -45,7 +61,7 @@ LOCAL_LANGUAGE_HINTS = {
     ),
     "runyankole": (
         "nyine", "esente", "omuguzi", "nashashura",
-        "nkuha", "aha", "obushomezi", "obuhango", "omuntu",
+        "nkuha", "obushomezi", "obuhango", "omuntu",
         "ebiragiro", "kuhemba", "okutamba", "nzire",
         "ekyooto", "orushomezi", "bwonka", "ntahe",
     ),
@@ -56,14 +72,14 @@ LOCAL_LANGUAGE_HINTS = {
     ),
     "luo": (
         "omiyo", "lim", "chudo", "ngato",
-        "bedo", "biro", "camo", "dano", "kare",
-        "ngo", "polo", "welo", "ber",
+        "bedo", "biro", "camo", "dano",
+        "ngo", "welo",
     ),
     "swahili": (
         "pesa", "kulipa", "mkopo", "mteja", "nitalipa",
         "fedha", "biashara", "bei", "malipo", "deni",
         "tafadhali", "asante", "habari", "sijui", "kesho",
-        "leo", "jana", "shilingi", "benki", "akaunti",
+        "jana", "shilingi", "benki", "akaunti",
     ),
 }
 
@@ -178,76 +194,116 @@ async def _detect_with_llm(text: str) -> dict[str, Any] | None:
     return None
 
 
-async def normalize_business_text(text: str) -> dict[str, Any]:
-    """
-    Return a normalized text package for downstream business extraction.
-    Uses two-stage language detection (IDEA 12).
-    If Sunbird is not configured or fails, preserve the original text safely.
-    """
-    detection = await detect_language_with_llm_fallback(text)
-    language = detection["language"]
 
-    if language == "english":
-        return {
-            "original_text": text,
-            "translated_text": text,
-            "normalized_text": text,
-            "original_language": language,
-            "language_confidence": detection["confidence"],
-            "provider": "none",
-            "detection_source": detection.get("source", "default"),
-        }
 
-    endpoint = os.environ.get("SUNBIRD_API_URL")
-    api_key = os.environ.get("SUNBIRD_API_KEY", "")
-    if not endpoint:
-        return {
-            "original_text": text,
-            "translated_text": text,
-            "normalized_text": text,
-            "original_language": language,
-            "language_confidence": detection["confidence"],
-            "provider": "local-detection-only",
-            "detection_source": detection.get("source"),
-            "warning": "SUNBIRD_API_URL not configured",
-        }
+# ── v8: Sunbird-backed normalisation ─────────────────────────────────────────
 
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.post(
-                endpoint.rstrip("/") + "/translate",
-                headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
-                json={
-                    "text": text,
-                    "source_language": language,
-                    "target_language": "english",
-                    "task": "business_normalization",
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
-    except Exception as exc:
-        logger.warning("sunbird_normalization_failed", extra={"error": str(exc), "language": language})
-        return {
-            "original_text": text,
-            "translated_text": text,
-            "normalized_text": text,
-            "original_language": language,
-            "language_confidence": detection["confidence"],
-            "provider": "sunbird-failed",
-            "detection_source": detection.get("source"),
-            "warning": str(exc),
-        }
+# Sunbird's language identification must be at least this sure before a
+# message is treated as non-English (short English messages like "Brian paid
+# 50k" are otherwise occasionally tagged as a local language).
+SUNBIRD_MIN_CONFIDENCE = 0.6
 
-    translated = data.get("translated_text") or data.get("translation") or text
-    normalized = data.get("normalized_text") or translated
+
+def _package(text: str, english: str, code: str, provider: str, source: str, **extra) -> dict[str, Any]:
+    from services.llm.sunbird import LANGUAGE_NAMES
+
     return {
         "original_text": text,
-        "translated_text": translated,
-        "normalized_text": normalized,
-        "original_language": data.get("source_language") or language,
-        "language_confidence": data.get("confidence", detection["confidence"]),
-        "provider": "sunbird",
-        "detection_source": detection.get("source"),
-        "raw_provider_response": data,
+        "english_text": english,
+        "language": code,
+        "language_name": LANGUAGE_NAMES.get(code, code),
+        "translated": english != text,
+        "provider": provider,
+        "detection_source": source,
+        # v5 keys, kept for older callers
+        "translated_text": english,
+        "normalized_text": english,
+        "original_language": code,
+        **extra,
     }
+
+
+async def detect_language_code(text: str) -> tuple[str, str]:
+    """(ISO 639-3 code, how it was detected). "eng" when English or unsure."""
+    from services.llm import sunbird
+
+    keyword = detect_language(text)
+    if keyword["source"] == "keyword":
+        return sunbird.NAME_TO_CODE.get(keyword["language"], "eng"), "keyword"
+
+    if sunbird.is_configured():
+        try:
+            code, confidence = await sunbird.identify_language(text)
+        except sunbird.SunbirdError as exc:
+            logger.warning("sunbird_language_id_failed", extra={"error": str(exc)})
+            return "eng", "default"
+        if code and code != "eng" and (confidence or 0) >= SUNBIRD_MIN_CONFIDENCE:
+            return code, "sunbird"
+    return "eng", "default"
+
+
+async def normalize_business_text(text: str) -> dict[str, Any]:
+    """
+    Language-normalise an owner message for the extractor. Never raises:
+    on any failure the original text is passed through untouched.
+    """
+    from services.llm import sunbird
+
+    text = text or ""
+    if not text.strip():
+        return _package(text, text, "eng", "none", "default")
+
+    code, source = await detect_language_code(text)
+    if code == "eng":
+        return _package(text, text, "eng", "none", source)
+
+    if not sunbird.is_configured():
+        return _package(text, text, code, "not-configured", source)
+
+    try:
+        english = await sunbird.translate(text, "eng", source_language=code)
+    except sunbird.SunbirdError as exc:
+        logger.warning("sunbird_translate_failed", extra={"error": str(exc), "language": code})
+        return _package(text, text, code, "sunbird-failed", source, warning=str(exc))
+
+    logger.info("message_translated", extra={"language": code, "detected_by": source})
+    return _package(text, english, code, "sunbird", source)
+
+
+_NUMBER_RE = re.compile(r"\d[\d,.]*\d|\d")
+_FOOTNOTE_RE = re.compile(r"\n?_\(confidence: \d+%\)_\s*$")
+
+
+def _numbers(text: str) -> list[str]:
+    return [n.replace(",", "").rstrip(".") for n in _NUMBER_RE.findall(text or "")]
+
+
+async def translate_reply(text: str, language: str | None) -> str | None:
+    """
+    The English reply in the owner's language, or None to send English.
+    None whenever Sunbird is unavailable or the translation lost a number.
+    """
+    from services.llm import sunbird
+
+    if not text or not language or language == "eng" or not sunbird.is_configured():
+        return None
+
+    footnote_match = _FOOTNOTE_RE.search(text)
+    footnote = footnote_match.group(0) if footnote_match else ""
+    body = text[: footnote_match.start()] if footnote_match else text
+
+    try:
+        translated = await sunbird.translate(body, language, source_language="eng")
+    except sunbird.SunbirdError as exc:
+        logger.warning("sunbird_reply_translate_failed", extra={"error": str(exc), "language": language})
+        return None
+
+    wanted = _numbers(body)
+    got = _numbers(translated)
+    for number in wanted:
+        if number in got:
+            got.remove(number)
+        else:
+            logger.warning("reply_translation_dropped_number", extra={"language": language, "number": number})
+            return None
+    return translated + footnote

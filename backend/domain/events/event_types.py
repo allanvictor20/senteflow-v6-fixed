@@ -32,6 +32,7 @@ class EventType(str, Enum):
     # Internal events
     BUSINESS_NOTE = "business_note"
     BUSINESS_QUERY = "business_query"   # owner asking about their own records
+    CORRECTION = "correction"           # owner fixing/undoing something already recorded
     FOLLOW_UP_REQUIRED = "follow_up_required"
     REMINDER_REQUEST = "reminder_request"
 
