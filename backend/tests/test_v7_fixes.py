@@ -189,3 +189,8 @@ async def test_failed_reminder_send_stays_pending():
 def test_speakable_strips_markup_and_emoji():
     from integrations.whatsapp.reply_sender import _speakable
     assert _speakable("✅ *Payment recorded*\nBrian paid _UGX 50,000_") == "Payment recorded\nBrian paid UGX 50,000"
+
+
+def test_speakable_drops_confidence_footnote():
+    from integrations.whatsapp.reply_sender import _speakable
+    assert _speakable("✅ *Payment recorded*\nBrian paid UGX 50,000\n_(confidence: 95%)_") == "Payment recorded\nBrian paid UGX 50,000"

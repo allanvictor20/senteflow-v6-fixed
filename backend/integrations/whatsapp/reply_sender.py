@@ -113,7 +113,9 @@ async def send_voice_aware(
 def _speakable(text: str) -> str:
     """Drop WhatsApp formatting marks and emoji so TTS doesn't read them out."""
     import re
-    cleaned = re.sub(r"[*_~`]", "", text or "")
+    # The "(confidence: 93%)" footnote helps on screen but is noise when spoken.
+    cleaned = re.sub(r"\n?_?\(confidence: \d+%\)_?", "", text or "")
+    cleaned = re.sub(r"[*_~`]", "", cleaned)
     cleaned = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]", "", cleaned)
     return re.sub(r"[ \t]+", " ", cleaned).strip()
 
