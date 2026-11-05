@@ -340,6 +340,10 @@ class MessageRouter:
                 context=context,
                 profile_repo=self.profile_repo,
             )
+            # Amounts without a currency use the business's default currency
+            # (Settings → Business profile), not a hard-coded UGX.
+            if business_event.entities.get("amount") is not None and not business_event.entities.get("currency"):
+                business_event.entities["currency"] = await self._currency()
 
             logger.info(
                 "event_classified",
@@ -543,7 +547,7 @@ class MessageRouter:
             return True
         lines = ["✅ *Marked as paid*"]
         for item in settled[:10]:
-            amt = f" — UGX {item['amount']:,.0f}" if item.get("amount") else ""
+            amt = f" — {item.get('currency') or await self._currency()} {item['amount']:,.0f}" if item.get("amount") else ""
             lines.append(f"  • {item['debtor']}{amt}")
         await self._reply(event, "\n".join(lines))
         return True
@@ -745,7 +749,7 @@ class MessageRouter:
         from services.responses.reply_generator import generate_summary_reply
         try:
             summary = await _repo_call(self.repo.compute_financial_summary, self.org_id)
-            await self._reply(event, generate_summary_reply(summary))
+            await self._reply(event, generate_summary_reply(summary, currency=await self._currency()))
         except Exception as exc:
             logger.error("summary_failed", extra={"error": str(exc)})
             await self._reply(event, "⚠️ Couldn't fetch summary right now. Please try again.")
@@ -768,12 +772,19 @@ class MessageRouter:
             lister = getattr(self.repo, "list_open_promises", None)
             if lister is not None:
                 promises = await _repo_call(lister, self.org_id)
-            await self._reply(event, generate_debt_reply(transactions, name_query, promises))
+            await self._reply(
+                event,
+                generate_debt_reply(transactions, name_query, promises, currency=await self._currency()),
+            )
         except Exception as exc:
             logger.error("debt_info_failed", extra={"error": str(exc)})
             await self._reply(event, "⚠️ Couldn't fetch debt information right now.")
 
     # ── Reply / memory helpers ────────────────────────────────────────────────
+
+    async def _currency(self) -> str:
+        from services.business_settings import business_currency
+        return await business_currency(self.profile_repo, self.org_id)
 
     async def _reply(self, event: MessageEvent, text: str) -> None:
         # Voice-aware reply: if the owner sent a voice note, answer with one

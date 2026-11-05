@@ -181,3 +181,20 @@ export async function unlinkWhatsAppNumber(orgId, phone) {
   const url = withParams(`/api/org/phones/${encodeURIComponent(phone)}`, { org_id: orgId });
   return handleResponse(await apiFetch(url, { method: "DELETE" }));
 }
+
+// ── Business profile (read by the AI on every WhatsApp message) ──────────────
+
+export async function getBusinessProfile(orgId) {
+  const url = withParams("/api/org/profile", { org_id: orgId });
+  return handleResponse(await apiFetch(url));
+}
+
+export async function saveBusinessProfile(orgId, profile) {
+  const url = withParams("/api/org/profile", { org_id: orgId });
+  const res = await apiFetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(profile),
+  });
+  return handleResponse(res);
+}

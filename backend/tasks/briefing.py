@@ -51,6 +51,11 @@ def build_briefing(repo, org_id: str, today: Optional[datetime] = None) -> Optio
     customers = _safe(lambda: repo.list_customers(org_id, limit=500), "customers") if hasattr(repo, "list_customers") else []
     promises = _safe(lambda: repo.list_open_promises(org_id), "promises") if hasattr(repo, "list_open_promises") else []
 
+    from services.business_settings import business_currency_sync
+    currency = business_currency_sync(repo._db, org_id) if hasattr(repo, "_db") else "UGX"
+    if not isinstance(currency, str):
+        currency = "UGX"
+
     lines: list[str] = []
 
     try:
@@ -61,7 +66,7 @@ def build_briefing(repo, org_id: str, today: Optional[datetime] = None) -> Optio
                 name = d.get("debtor") or d.get("customer") or "Unknown"
                 amt = d.get("amount")
                 try:
-                    amt_str = f" — UGX {float(amt):,.0f}" if amt else ""
+                    amt_str = f" — {currency} {float(amt):,.0f}" if amt else ""
                 except (TypeError, ValueError):
                     amt_str = ""
                 lines.append(f"  • {name}{amt_str}")
