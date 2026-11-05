@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { C, s } from "../../utils/theme";
-import { fmt } from "../../utils/format";
+import { fmt, isToday, moneyDirection, signedAmount } from "../../utils/format";
 import { getCustomers, getMediaAssets, getOrders } from "../../services/api";
 import KpiCard from "./KpiCard";
 import WhatsAppStatusCard from "./WhatsAppStatusCard";
@@ -47,6 +47,12 @@ export default function DashboardView({ summary, summaryError, transactions, ale
       ? total + Number(t.amount || t.entities?.amount || 0)
       : total;
   }, 0);
+  // Only entries recorded today — this used to show the size of the whole feed.
+  const eventsToday = transactions.filter((t) => isToday(t.created_at || t.timestamp)).length;
+  const amountColor = (t) => {
+    const dir = moneyDirection(t.transaction_type || t.type || t.event_type);
+    return dir === "in" ? C.green : dir === "out" ? C.red : dir === "owed" ? C.yellow : C.textMuted;
+  };
   const CLOSED_ORDER = ["completed", "delivered", "cancelled"];
   const pendingOrders = controlData.orders.filter((o) => !CLOSED_ORDER.includes(o.status));
   const unpaidOrders = controlData.orders.filter((o) => o.payment_status === "unpaid" && o.status !== "cancelled");
@@ -75,9 +81,9 @@ export default function DashboardView({ summary, summaryError, transactions, ale
 
       {/* KPI Row */}
       <div style={s.cardGrid4}>
-        <KpiCard label="Events Today" value={transactions.length} color={C.accent} sub="from WhatsApp and uploads" />
+        <KpiCard label="Events Today" value={eventsToday} color={C.accent} sub="from WhatsApp and uploads" />
         <KpiCard label="Follow-ups Needed" value={pendingDeliveries.length + alerts.length} color={C.yellow} />
-        <KpiCard label="Revenue This Week" value={fmt(revenueThisWeek || summary.total_income || 0)} color={C.green} />
+        <KpiCard label="Revenue This Week" value={fmt(revenueThisWeek)} color={C.green} sub="payments received, last 7 days" />
         <KpiCard label="Customers Active" value={controlData.customers.length} color={C.white} sub={`${unpaidOrders.length} unresolved`} />
       </div>
 
@@ -146,9 +152,8 @@ export default function DashboardView({ summary, summaryError, transactions, ale
                     )}
                   </div>
                 </div>
-                <span style={{ color: ["contribution", "income", "payment"].includes(t.type || t.transaction_type) ? C.green : C.red, fontWeight: 700, fontSize: 13, flexShrink: 0 }}>
-                  {["contribution", "income", "payment"].includes(t.type || t.transaction_type) ? "+" : "-"}
-                  {t.currency || "UGX"} {Number(t.amount).toLocaleString()}
+                <span style={{ color: amountColor(t), fontWeight: 700, fontSize: 13, flexShrink: 0 }}>
+                  {signedAmount(t)}
                 </span>
               </div>
             ))

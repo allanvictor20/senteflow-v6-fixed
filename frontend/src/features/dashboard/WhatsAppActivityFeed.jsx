@@ -16,7 +16,7 @@ export default function WhatsAppActivityFeed({ transactions }) {
 
   const getActivityIcon = (type) => {
     const icons = {
-      contribution: "💚", income: "💚", payment: "💰",
+      contribution: "💚", income: "💚", payment: "💰", debt_created: "📒", payment_promise: "📅",
       expense: "🔴", loan: "🏦", loan_repayment: "↩️",
       withdrawal: "💸", fine: "⚠️",
     };
@@ -24,11 +24,15 @@ export default function WhatsAppActivityFeed({ transactions }) {
   };
 
   const getActivityText = (txn) => {
-    const person = txn.payer || txn.payee || txn.member_name || "Someone";
+    const person = txn.customer_name || txn.payer || txn.payee || txn.member_name || "Someone";
     const amount = `${txn.currency || "UGX"} ${Number(txn.amount).toLocaleString()}`;
     const type = txn.transaction_type || txn.type || "transaction";
     if (type === "contribution" || type === "payment") {
       return { primary: `${person} paid ${amount}`, secondary: txn.description };
+    }
+    if (type === "debt_created") {
+      const who = txn.customer_name || txn.debtor || txn.payer || "Someone";
+      return { primary: `${who} owes ${amount}`, secondary: txn.description };
     }
     if (type === "loan") {
       return { primary: `Loan issued to ${person}: ${amount}`, secondary: txn.description };
