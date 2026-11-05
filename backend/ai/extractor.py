@@ -6,8 +6,8 @@ This layer does NOT validate, persist, or apply business logic.
 It only converts raw files/bytes into structured domain objects.
 
 Provider notes:
-  - Text extraction uses `llama-3.3-70b-versatile` (override via GROQ_MODEL).
-  - Image extraction uses `llama-3.2-90b-vision-preview` (override via GROQ_VISION_MODEL).
+  - Text extraction uses services/llm/models.text_model() (default openai/gpt-oss-120b).
+  - Image extraction uses services/llm/models.vision_model() (default qwen/qwen3.8-27b).
   - PDF: Groq does not accept PDFs directly. We extract text with pypdf,
     then run the text extractor over it.
   - Audio (≤30s): transcribe with Deepgram nova-2 (fallback: Groq Whisper),
@@ -46,10 +46,14 @@ from prompts.extraction_prompts import ACTIVE_EXTRACTION
 
 logger = logging.getLogger(__name__)
 
-GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-DEFAULT_GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-DEFAULT_GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "llama-3.2-90b-vision-preview")
-DEFAULT_GROQ_WHISPER_MODEL = os.environ.get("GROQ_WHISPER_MODEL", "whisper-large-v3")
+from services.llm import models as llm_models
+
+GROQ_BASE_URL = llm_models.GROQ_BASE_URL
+# Module-level names kept for backward compatibility. Calls below read the
+# model at call time (after load_dotenv) via llm_models.*_model().
+DEFAULT_GROQ_MODEL = llm_models.DEFAULT_TEXT_MODEL
+DEFAULT_GROQ_VISION_MODEL = llm_models.DEFAULT_VISION_MODEL
+DEFAULT_GROQ_WHISPER_MODEL = llm_models.DEFAULT_WHISPER_MODEL
 
 MODEL_ID = DEFAULT_GROQ_MODEL
 
@@ -96,20 +100,13 @@ def _client_factory() -> OpenAI:
         api_key = os.environ.get("GROQ_API_KEY")
         if not api_key:
             raise RuntimeError("GROQ_API_KEY is not set — cannot run AI extraction")
-        _client_instance = OpenAI(api_key=api_key, base_url=GROQ_BASE_URL)
+        _client_instance = OpenAI(api_key=api_key, base_url=GROQ_BASE_URL, timeout=90)
     return _client_instance
 
 
 def _parse_extraction(content: str) -> ExtractionResult:
-    """Parse raw LLM JSON output into ExtractionResult, tolerant of markdown fences."""
-    raw = (content or "").strip()
-    if raw.startswith("```"):
-        parts = raw.split("```")
-        if len(parts) >= 2:
-            raw = parts[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        raw = raw.strip()
+    """Parse raw LLM JSON output into ExtractionResult, tolerant of fences and reasoning tags."""
+    raw = llm_models.clean_completion(content)
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -122,11 +119,14 @@ def _parse_extraction(content: str) -> ExtractionResult:
 def _run_text_extraction(user_prompt: str, system_prompt: str = ACTIVE_EXTRACTION) -> ExtractionResult:
     """Common path: send a text prompt to Groq with JSON mode, parse, return."""
     client = _client_factory()
+    model = llm_models.text_model()
+    extra = llm_models.groq_extra_body(model)
     response = client.chat.completions.create(
-        model=DEFAULT_GROQ_MODEL,
+        model=model,
         temperature=0.0,
-        max_tokens=2000,
+        max_tokens=4000,
         response_format={"type": "json_object"},
+        **({"extra_body": extra} if extra else {}),
         messages=[
             {"role": "system", "content": system_prompt + "\n\n" + _SCHEMA_INSTRUCTION},
             {"role": "user", "content": user_prompt},
@@ -208,10 +208,12 @@ def extract_from_image(
 ) -> ExtractionResult:
     """
     Extract business events from an image using Groq's vision model
-    (default: llama-3.2-90b-vision-preview). The image is sent as a base64
-    data URL alongside a text instruction.
+    (default: qwen/qwen3.8-27b). The image is sent as a base64 data URL
+    alongside a text instruction.
     """
     client = _client_factory()
+    model = llm_models.vision_model()
+    extra = llm_models.groq_extra_body(model)
     b64 = base64.b64encode(image_bytes).decode("ascii")
     data_url = f"data:{mime_type or 'image/jpeg'};base64,{b64}"
 
@@ -222,9 +224,11 @@ def extract_from_image(
     )
 
     response = client.chat.completions.create(
-        model=DEFAULT_GROQ_VISION_MODEL,
+        model=model,
         temperature=0.0,
-        max_tokens=2000,
+        max_tokens=4000,
+        response_format={"type": "json_object"},
+        **({"extra_body": extra} if extra else {}),
         messages=[
             {
                 "role": "system",
@@ -354,34 +358,11 @@ def extract_from_audio(
         )
 
     # ── Short-audio path: single-pass ──────────────────────────────────────
-    # Transcribe with Deepgram (falls back to Whisper internally)
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        # We're inside an async caller (e.g. media_extraction_workflow called
-        # via asyncio.to_thread). Create a fresh loop for the sync path.
-        import threading
-        result_box = {}
-        def _run():
-            try:
-                new_loop = asyncio.new_event_loop()
-                try:
-                    result_box["t"] = new_loop.run_until_complete(
-                        transcribe_audio_bytes(audio_bytes, mime_type)
-                    )
-                finally:
-                    new_loop.close()
-            except Exception as exc:
-                result_box["err"] = exc
-        t = threading.Thread(target=_run)
-        t.start()
-        t.join()
-        if "err" in result_box:
-            raise result_box["err"]
-        transcript = result_box.get("t", "") or ""
-    else:
-        transcript = loop.run_until_complete(
-            transcribe_audio_bytes(audio_bytes, mime_type)
-        )
+    # Transcribe with Deepgram (falls back to Whisper internally).
+    # This function is synchronous and normally runs inside asyncio.to_thread,
+    # where asyncio.get_event_loop() raises — _run_coro_blocking handles both
+    # "no loop in this thread" and "called from inside a running loop".
+    transcript = _run_coro_blocking(transcribe_audio_bytes(audio_bytes, mime_type)) or ""
 
     transcript = (transcript or "").strip()
     if not transcript:
@@ -430,7 +411,7 @@ def _extract_from_audio_segmented(
     of the LLM trying to parse everything in one shot and missing details.
     """
     import asyncio
-    from services.llm.media_processor import segment_voice_memo, transcribe_segments
+    from services.llm.media_processor import segment_voice_memo, transcribe_segments, transcribe_audio_bytes
 
     # Step 1: segment with Silero VAD
     segments = segment_voice_memo(audio_bytes, mime_type)
@@ -440,12 +421,7 @@ def _extract_from_audio_segmented(
         # Recursively call extract_from_audio but force the duration check to
         # take the short path. We do this by transcribing the whole thing
         # directly here, avoiding infinite recursion.
-        loop = asyncio.get_event_loop()
-        transcript = loop.run_until_complete(
-            transcribe_audio_bytes(audio_bytes, mime_type)
-        ) if not loop.is_running() else _run_async_in_thread(
-            transcribe_audio_bytes(audio_bytes, mime_type)
-        )
+        transcript = _run_coro_blocking(transcribe_audio_bytes(audio_bytes, mime_type))
         transcript = (transcript or "").strip()
         if not transcript:
             return ExtractionResult(
@@ -472,11 +448,7 @@ def _extract_from_audio_segmented(
         return result
 
     # Step 2: transcribe each segment with Deepgram (parallel)
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        segments = _run_async_in_thread(transcribe_segments(segments, mime_type))
-    else:
-        segments = loop.run_until_complete(transcribe_segments(segments, mime_type))
+    segments = _run_coro_blocking(transcribe_segments(segments, mime_type))
 
     # Filter out segments with empty transcripts
     valid_segments = [s for s in segments if s.transcript.strip()]
@@ -532,6 +504,23 @@ def _extract_from_audio_segmented(
         merged.transactions, session_id, file_name, mime_type, full_transcript
     )
     return merged
+
+
+def _run_coro_blocking(coro):
+    """
+    Run a coroutine to completion from synchronous code.
+
+    - No event loop running in this thread (the normal case: we are inside
+      asyncio.to_thread) → asyncio.run().
+    - Called from a thread that is already running a loop → run it on a
+      fresh loop in a helper thread so we don't deadlock the caller's loop.
+    """
+    import asyncio
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    return _run_async_in_thread(coro)
 
 
 def _run_async_in_thread(coro):

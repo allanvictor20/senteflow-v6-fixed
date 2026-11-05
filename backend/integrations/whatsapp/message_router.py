@@ -1,31 +1,34 @@
 """
-SenteFlow AI — Message Router (v6 — Unified Event Pipeline)
-============================================================
-Gap 2 fix: Removed dual routing. Everything goes through _route_via_event_pipeline.
-Gap 5 fix: Added PendingStateManager for multi-turn clarification state.
+SenteFlow AI — Message Router (v7)
+===================================
+Routes one business owner's WhatsApp messages through the event pipeline.
 
-BUG FIX (v6.1): MessageEvent.model_copy() replaces the broken __dict__ splat.
-  Old (crashes):  MessageEvent(**{**event.__dict__, "text": merged_text})
-  New (correct):  event.model_copy(update={"text": merged_text})
+Who is talking: every message here comes from a phone number linked to this
+business (see services/tenancy.py) — the owner or their staff. Customers never
+message SenteFlow; the owner tells SenteFlow about them ("Brian paid 50k").
 
-Old flow (v5, broken):
-  text → classify_intent → if whitelisted → run_message_workflow (legacy)
-                         → else          → detect_intent (second LLM call)
-                         → else          → _route_via_event_pipeline
+Text flow:
+  pending question? ── approval (YES/NO) → resume / cancel the paused event
+                    ── reminder follow-up (YES) → mark settled
+                    ── clarification → merge the answer and re-run
+  → ContextEngine (owner-level context)
+  → extract_event (LLM)                         → BusinessEvent
+  → business_query? answer from the records and stop
+  → low-confidence money event? ask BEFORE recording anything
+  → resolve the customer from the message (ask if ambiguous)
+  → ActionDispatcher (may pause for approval or clarification)
+  → reply, remember, update customer memory
 
-New flow (v6, unified):
-  text → check pending_state → if awaiting_clarification → merge + re-run
-       → _route_via_event_pipeline (ContextEngine → EventInterpreter → ActionDispatcher)
-
-Summary / help / greeting shortcuts are handled inside _handle_simple_commands
-so we don't need pre-routing for those.
+Voice notes are transcribed and each utterance goes through the text flow
+(so voice can do everything text can, including questions and reminders).
+Receipt photos and documents go through the file extraction pipeline.
 """
 
 import asyncio
-import logging
 import inspect
+import logging
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from core.message_event import MessageEvent, MessageType
 from services.actions.action_dispatcher import ActionDispatcher
@@ -36,6 +39,9 @@ if TYPE_CHECKING:
     from repositories.transaction_repository import TransactionRepository
 
 logger = logging.getLogger(__name__)
+
+# Money events below this confidence get a question before anything is saved.
+CLARIFY_BELOW_CONFIDENCE = 0.75
 
 # Fire-and-forget tasks must be strongly referenced, otherwise the event loop
 # is free to garbage-collect them mid-flight and the work silently vanishes.
@@ -54,6 +60,14 @@ async def _maybe_await(value):
     return value
 
 
+async def _repo_call(fn, *args, **kwargs):
+    """Run a (usually synchronous) repository call off the event loop."""
+    if inspect.iscoroutinefunction(fn):
+        return await fn(*args, **kwargs)
+    result = await asyncio.to_thread(fn, *args, **kwargs)
+    return await _maybe_await(result)
+
+
 def _mentions(text: str, terms: tuple[str, ...]) -> bool:
     """
     Whole-word containment test.
@@ -64,12 +78,42 @@ def _mentions(text: str, terms: tuple[str, ...]) -> bool:
     return any(re.search(rf"\b{re.escape(term)}\b", text) for term in terms)
 
 
-# ── Gap 5: Pending Clarification State ────────────────────────────────────────
+_YES = {
+    "yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "confirm", "confirmed",
+    "correct", "go ahead", "proceed", "paid", "settled", "done",
+    "ye", "yee", "yego", "kale", "ndiyo", "sawa", "ego",
+}
+_NO = {
+    "no", "n", "nope", "nah", "cancel", "stop", "don't", "dont", "not yet", "not paid",
+    "nedda", "hapana", "si",
+}
+
+
+def _yes_no(text: str) -> Optional[bool]:
+    """Interpret a short reply as yes/no. None when it is not a yes/no answer."""
+    t = re.sub(r"[^\w\s']", " ", (text or "").lower()).strip()
+    t = re.sub(r"\s+", " ", t)
+    if not t or len(t.split()) > 4:
+        return None
+    if t in _YES or t.split()[0] in _YES:
+        return True
+    if t in _NO or t.split()[0] in _NO:
+        return False
+    return None
+
+
+# ── Pending question state ────────────────────────────────────────────────────
 
 class PendingStateManager:
     """
-    Tracks whether the bot has asked a clarification question and is
-    waiting for the user to answer it.  State lives in Firestore via repo.
+    Remembers that the bot asked the owner something and is waiting for the
+    answer. Stored on the owner's conversation document (keyed by their
+    WhatsApp id), with an in-memory fallback if Firestore is unavailable.
+
+    pending_intent:
+      awaiting_clarification  — pending_context.original_text
+      awaiting_approval       — pending_context.event / action / completed
+      awaiting_reminder_ack   — pending_context.reminder_ids
     """
 
     def __init__(self, repo, org_id: str):
@@ -77,49 +121,74 @@ class PendingStateManager:
         self.org_id = org_id
         self._pending_cache: dict[str, dict] = {}
 
+    async def _set(self, sender_id: str, intent: str, context: dict, question: str) -> None:
+        state = {
+            "pending_intent": intent,
+            "pending_context": context,
+            "pending_question": question,
+        }
+        self._pending_cache[sender_id] = state
+        try:
+            await _repo_call(self.repo.upsert_conversation, self.org_id, sender_id, dict(state))
+        except Exception as exc:
+            logger.warning("pending_state_write_failed", extra={"error": str(exc)})
+
     async def set_pending_clarification(
         self,
         sender_id: str,
         original_text: str,
         clarification_question: str,
     ) -> None:
-        try:
-            await _maybe_await(self.repo.upsert_conversation(
-                self.org_id,
-                sender_id,
-                {
-                    "pending_intent": "awaiting_clarification",
-                    "pending_context": {"original_text": original_text},
-                    "pending_question": clarification_question,
-                },
-            ))
-            self._pending_cache[sender_id] = {
-                "pending_intent": "awaiting_clarification",
-                "pending_context": {"original_text": original_text},
-                "pending_question": clarification_question,
-            }
-        except Exception as exc:
-            logger.warning("pending_state_write_failed", extra={"error": str(exc)})
+        await self._set(
+            sender_id,
+            "awaiting_clarification",
+            {"original_text": original_text},
+            clarification_question,
+        )
+
+    async def set_pending_approval(
+        self,
+        sender_id: str,
+        event_data: dict,
+        action: str,
+        completed: list[str],
+        question: str,
+    ) -> None:
+        await self._set(
+            sender_id,
+            "awaiting_approval",
+            {"event": event_data, "action": action, "completed": list(completed)},
+            question,
+        )
+
+    async def set_pending_reminder_ack(self, sender_id: str, reminder_ids: list[str], question: str) -> None:
+        await self._set(sender_id, "awaiting_reminder_ack", {"reminder_ids": list(reminder_ids)}, question)
 
     async def get_pending_state(self, sender_id: str) -> dict | None:
+        """
+        Firestore is the source of truth when it answers (another instance may
+        have cleared or set the state). The in-memory copy is only used when
+        the conversation document can't be read or doesn't exist yet.
+        """
         try:
-            conv = await _maybe_await(self.repo.get_conversation(self.org_id, sender_id))
-            if conv and conv.get("pending_intent"):
-                return conv
-            if sender_id in self._pending_cache:
-                return self._pending_cache[sender_id]
+            conv = await _repo_call(self.repo.get_conversation, self.org_id, sender_id)
         except Exception as exc:
             logger.warning("pending_state_read_failed", extra={"error": str(exc)})
-        return None
+            conv = None
+        if conv:
+            return conv if conv.get("pending_intent") else None
+        cached = self._pending_cache.get(sender_id)
+        return cached if cached and cached.get("pending_intent") else None
 
     async def clear_pending(self, sender_id: str) -> None:
+        self._pending_cache.pop(sender_id, None)
         try:
-            await _maybe_await(self.repo.upsert_conversation(
+            await _repo_call(
+                self.repo.upsert_conversation,
                 self.org_id,
                 sender_id,
                 {"pending_intent": None, "pending_context": None, "pending_question": None},
-            ))
-            self._pending_cache.pop(sender_id, None)
+            )
         except Exception as exc:
             logger.warning("pending_state_clear_failed", extra={"error": str(exc)})
 
@@ -127,7 +196,7 @@ class PendingStateManager:
 # ── Router ─────────────────────────────────────────────────────────────────────
 
 class MessageRouter:
-    """Routes normalized MessageEvent objects to the unified event pipeline."""
+    """Routes normalized MessageEvent objects for ONE business."""
 
     def __init__(
         self,
@@ -137,6 +206,7 @@ class MessageRouter:
         mem_repo=None,
         profile_repo=None,
         org_config=None,
+        customer_memory_svc=None,
     ):
         self.wa_client = wa_client
         self.repo = repo
@@ -144,7 +214,8 @@ class MessageRouter:
         self.mem_repo = mem_repo
         self.profile_repo = profile_repo
         self.org_config = org_config
-        # Set by main.py after all bounded contexts are initialised
+        self.customer_memory_svc = customer_memory_svc
+        # Optional replacement for ActionDispatcher (kept for older wiring).
         self.event_pipeline = None
         # One manager per router, not per message: its in-memory fallback cache
         # is useless if a fresh instance is constructed on every turn.
@@ -153,24 +224,22 @@ class MessageRouter:
     async def route(self, event: MessageEvent) -> None:
         logger.info(
             "routing_message",
-            extra={"type": event.message_type.value, "sender": event.display_sender},
+            extra={"type": event.message_type.value, "sender": event.display_sender, "org_id": self.org_id},
         )
 
         match event.message_type:
             case MessageType.TEXT:
                 await self._route_text(event)
-            case MessageType.IMAGE:
-                await self._route_via_event_pipeline(event)
             case MessageType.VOICE | MessageType.AUDIO:
-                await self._route_via_event_pipeline(event)
-            case MessageType.DOCUMENT:
-                await self._route_via_event_pipeline(event)
+                await self._route_voice(event)
+            case MessageType.IMAGE | MessageType.DOCUMENT:
+                await self._process_media_extraction(event, source_hint=event.message_type.value)
             case MessageType.VIDEO:
                 await self._reply_unsupported(event, "video files")
             case MessageType.STICKER:
                 pass
             case MessageType.LOCATION:
-                await self._reply(event, "📍 Location noted. I can only process financial records for now.")
+                await self._reply(event, "📍 Location noted. I can only process business records for now.")
             case _:
                 await self._reply(
                     event,
@@ -178,90 +247,85 @@ class MessageRouter:
                     "Try sending a receipt photo, voice note, or text like \"Brian paid 50k for feed\".",
                 )
 
-    # ── Gap 2: Unified text routing ───────────────────────────────────────────
+    # ── Text ──────────────────────────────────────────────────────────────────
 
     async def _route_text(self, event: MessageEvent) -> None:
-        """
-        Gap 2 fix: All text messages flow through a single unified path.
-        Gap 5 fix: Check for pending clarification state first.
-        BUG FIX:   Use model_copy() instead of **__dict__ splat to rebuild MessageEvent.
-        """
         if not event.text:
             return
 
-        pending_mgr = self.pending_mgr
+        pending = await self.pending_mgr.get_pending_state(event.sender_id)
+        intent = (pending or {}).get("pending_intent")
 
-        # Gap 5 — check if bot is waiting for an answer to a clarification question
-        pending = await pending_mgr.get_pending_state(event.sender_id)
-        if pending and pending.get("pending_intent") == "awaiting_clarification":
-            original_text = pending.get("pending_context", {}).get("original_text", "")
-            # Merge the original ambiguous message with the user's clarification reply
-            merged_text = f"{original_text} — {event.text or ''}"
+        if intent == "awaiting_approval":
+            if await self._handle_approval_reply(event, pending):
+                return
+        elif intent == "awaiting_reminder_ack":
+            if await self._handle_reminder_ack(event, pending):
+                return
+        elif intent == "awaiting_clarification":
+            original_text = (pending.get("pending_context") or {}).get("original_text", "")
+            merged_text = f"{original_text} — {event.text}" if original_text else event.text
             logger.info(
                 "resolving_pending_clarification",
                 extra={"sender": event.sender_id, "merged": merged_text[:80]},
             )
-            await pending_mgr.clear_pending(event.sender_id)
-
-            # BUG FIX: use model_copy() — the only correct way to copy a Pydantic model
-            # with field overrides.  **__dict__ splat breaks because Pydantic stores
-            # internal state (__fields_set__, __private_attributes__) alongside field
-            # values; splatting all of them into the constructor raises TypeError.
+            await self.pending_mgr.clear_pending(event.sender_id)
+            # model_copy() is the correct way to copy a Pydantic model with overrides.
             merged_event = event.model_copy(update={"text": merged_text})
-            await self._route_via_event_pipeline(merged_event)
+            await self._route_via_event_pipeline(merged_event, already_clarified=True)
             return
 
-        # Gap 2 — all text flows through the unified event pipeline
         await self._route_via_event_pipeline(event)
 
-    # ── Unified Event Pipeline ─────────────────────────────────────────────────
+    # ── Voice ─────────────────────────────────────────────────────────────────
 
-    async def _route_via_event_pipeline(self, event: MessageEvent) -> None:
-        """
-        Unified path:
-          ContextEngine → EventInterpreter → ActionDispatcher → WhatsApp reply
+    async def _route_voice(self, event: MessageEvent) -> None:
+        """Transcribe, then treat each utterance like a text message."""
+        from integrations.whatsapp.media_handler import save_whatsapp_media
+        from services.llm.media_processor import MediaDownloadError, transcribe_voice_note
 
-        Gap 3: ContextEngine is called for ALL messages (text and media).
-        Gap 4: Memory is fetched and injected into context before AI calls.
-        Gap 5: Clarification replies set pending state in Firestore.
-        """
-        from services.memory.context_engine import ContextEngine
-
-        # Media goes straight to the file extraction pipeline. Asking the text
-        # classifier to interpret an empty string first would cost an LLM call
-        # and could never return anything useful.
-        if event.is_media:
-            media_label = {
-                MessageType.IMAGE: "📸 image",
-                MessageType.VOICE: "🎤 voice note",
-                MessageType.AUDIO: "🎤 voice note",
-                MessageType.DOCUMENT: "📄 document",
-            }.get(event.message_type, "file")
-            await self._reply(event, f"Got your {media_label}, {event.display_sender}! Processing...")
-            await self._process_media_extraction(event, source_hint=event.message_type.value)
+        try:
+            file_path = await save_whatsapp_media(event, self.wa_client)
+        except MediaDownloadError as exc:
+            logger.error("voice_download_failed", extra={"error": str(exc), "sender": event.sender_id})
+            await self._reply(event, "⚠️ I couldn't download that voice note from WhatsApp. Please send it again.")
+            return
+        if not file_path:
+            await self._reply(event, "⚠️ I couldn't access that voice note. Please send it again.")
             return
 
         try:
-            # ── Gap 3: Build context for EVERY message before any AI call ────
+            audio_bytes = await asyncio.to_thread(_read_bytes, file_path)
+            utterances = await transcribe_voice_note(audio_bytes, event.media_mime_type)
+        except Exception as exc:
+            logger.error("voice_transcription_failed", extra={"error": str(exc)})
+            utterances = []
+
+        if not utterances:
+            await self._reply(event, "🎤 I couldn't make out that voice note. Could you say it again, or type it?")
+            return
+
+        for text in utterances:
+            await self._route_text(event.model_copy(update={"text": text}))
+
+    # ── Unified event pipeline ────────────────────────────────────────────────
+
+    async def _route_via_event_pipeline(self, event: MessageEvent, already_clarified: bool = False) -> None:
+        from services.memory.context_engine import ContextEngine
+        from domain.events.event_types import EventType
+
+        try:
+            # Owner-level context; the customer isn't known until extraction.
             context_engine = ContextEngine(repo=self.repo, org_id=self.org_id, mem_repo=self.mem_repo)
             context = await context_engine.get_context(
                 sender_id=event.sender_id,
                 raw_message=event.text or "",
             )
-            logger.info(
-                "context_built",
-                extra={
-                    "sender": event.sender_id,
-                    "customer_risk": context.get("customer", {}).get("risk_level", "unknown"),
-                    "open_orders": len(context.get("open_orders", [])),
-                },
-            )
 
-            # ── Gap 4: Inject conversation memory into context ────────────────
             try:
                 from memory.conversation_memory import ConversationMemory
-                interactions = ConversationMemory(self.repo, self.org_id).last_interactions(
-                    event.sender_id, limit=5
+                interactions = await asyncio.to_thread(
+                    ConversationMemory(self.repo, self.org_id).last_interactions, event.sender_id, 5
                 )
                 context["recent_memory"] = _format_memory_for_prompt(interactions)
                 context["raw_interactions"] = interactions
@@ -269,13 +333,6 @@ class MessageRouter:
                 logger.warning("memory_inject_failed", extra={"error": str(exc)})
                 context["recent_memory"] = "No prior interactions."
 
-            # NOTE: the WhatsApp client is deliberately NOT put into `context`.
-            # `context` ends up on BusinessEvent and gets serialised to
-            # Firestore; a live HTTP client in there makes the event
-            # unserialisable. Anything needing the client takes it as an argument.
-
-            # ── Interpret → BusinessEvent ─────────────────────────────────────
-            # extract_event is a coroutine function, not a class — call it directly.
             business_event = await extract_event(
                 raw_message=event.text or "",
                 sender_id=event.sender_id,
@@ -293,125 +350,283 @@ class MessageRouter:
                 },
             )
 
-            # ── Handle simple commands that don't need ActionDispatcher ───────
-            command_handled = await self._handle_simple_commands(event, business_event, context)
-            if command_handled:
+            # ── Questions about the owner's own records ───────────────────────
+            if business_event.event_type == EventType.BUSINESS_QUERY:
+                await self._answer_query(event, business_event)
+                await self._remember(event, "business_query", business_event.entities)
                 return
 
-            # ── Dispatch actions through EventPipeline (new) or ActionDispatcher ──
-            pipeline = getattr(self, "event_pipeline", None)
-            if pipeline is not None:
-                pipeline_result = await pipeline.process(business_event)
-                result = pipeline_result.action_result
-                if result is None:
-                    # Fallback: create a minimal result so reply logic works
-                    from domain.events.business_event import EventResult
-                    result = EventResult(event_id=business_event.event_id, success=True)
-            else:
-                dispatcher = ActionDispatcher(repo=self.repo, org_id=self.org_id, org_config=self.org_config)
-                result = await dispatcher.dispatch(business_event)
+            if await self._handle_simple_commands(event, business_event, context):
+                return
 
-            raw_reply = result.whatsapp_reply
-            is_clarification = False
-
-            if business_event.is_financial() and business_event.entities.get("amount"):
-                from ai.reply_generator import generate_smart_confirmation
-
-                reply_obj = await generate_smart_confirmation(
-                    data=business_event.entities,
-                    confidence=business_event.confidence,
-                    original_text=event.text or "",
+            # ── Ask BEFORE recording when unsure about money ─────────────────
+            # (Asking after dispatch recorded the transaction, and the merged
+            # answer then recorded it a second time.)
+            if (
+                not already_clarified
+                and business_event.is_financial()
+                and business_event.confidence < CLARIFY_BELOW_CONFIDENCE
+            ):
+                from ai.reply_generator import generate_clarification
+                question = await generate_clarification(
+                    business_event.entities, business_event.confidence, event.text or ""
                 )
-                raw_reply = reply_obj.text
-                is_clarification = reply_obj.is_clarification
-            elif not raw_reply:
-                raw_reply = f"Recorded. {business_event.to_summary()}"
+                await self.pending_mgr.set_pending_clarification(event.sender_id, event.text or "", question)
+                await self._reply(event, question)
+                await self._remember(event, "clarification_requested", business_event.entities)
+                return
 
-            if is_clarification:
+            # ── Which customer is this about? ─────────────────────────────────
+            from services.conversation.customer_resolution import CustomerResolver
+            resolution = await asyncio.to_thread(
+                CustomerResolver(self.repo, self.org_id).resolve_for_event, business_event
+            )
+            if resolution.needs_clarification:
                 await self.pending_mgr.set_pending_clarification(
-                    sender_id=event.sender_id,
-                    original_text=event.text or "",
-                    clarification_question=raw_reply,
+                    event.sender_id, event.text or "", resolution.clarification_question
                 )
+                await self._reply(event, resolution.clarification_question)
+                return
 
-            await self._reply(event, raw_reply)
-            await self._remember(
-                event,
-                business_event.event_type.value if business_event.event_type else "unknown",
-                business_event.entities,
-            )
-
-            if business_event.requires_followup():
-                from services.memory.memory_engine import BusinessMemoryEngine
-                memory = BusinessMemoryEngine(repo=self.repo, org_id=self.org_id)
-                memory.remember_event(business_event)
-
-            # FIX (v2): Piggyback reminder check on every real message — no scheduler needed.
-            # Fires overdue reminders when the business owner is actively texting the bot.
-            # Runs as a non-blocking task so it never delays the current reply.
-            from tasks.reminder_sender import send_overdue_reminders as _send_reminders
-            _spawn(
-                _send_reminders(self.wa_client, self.repo, self.org_id),
-                name=f"overdue_reminders:{self.org_id}",
-            )
+            result = await self._dispatch(business_event)
+            await self._after_dispatch(event, business_event, result)
 
         except Exception as exc:
             logger.error("event_pipeline_failed", extra={"error": str(exc), "sender": event.sender_id})
             await self._reply(event, "⚠️ Something went wrong processing your message. Please try again.")
 
+    async def _dispatch(self, business_event, approved_actions=(), skip_actions=()):
+        pipeline = getattr(self, "event_pipeline", None)
+        if pipeline is not None:
+            pipeline_result = await pipeline.process(business_event)
+            result = pipeline_result.action_result
+            if result is None:
+                from domain.events.business_event import EventResult
+                result = EventResult(event_id=business_event.event_id, success=True)
+            return result
+        dispatcher = ActionDispatcher(repo=self.repo, org_id=self.org_id, org_config=self.org_config)
+        return await dispatcher.dispatch(
+            business_event,
+            approved_actions=approved_actions,
+            skip_actions=skip_actions,
+        )
+
+    async def _after_dispatch(self, event: MessageEvent, business_event, result) -> None:
+        """Reply to the owner and record what happened."""
+        reply = getattr(result, "whatsapp_reply", "") or ""
+        if not isinstance(reply, str):
+            reply = str(reply)
+
+        if getattr(result, "pending_approval", False) is True:
+            await self.pending_mgr.set_pending_approval(
+                sender_id=event.sender_id,
+                event_data=business_event.to_storable(),
+                action=result.pending_action or "",
+                completed=list(getattr(result, "completed_actions", []) or []),
+                question=reply,
+            )
+            await self._reply(event, reply)
+            await self._remember(event, "approval_requested", business_event.entities)
+            return
+
+        if getattr(result, "needs_clarification", False) is True:
+            await self.pending_mgr.set_pending_clarification(
+                event.sender_id, business_event.raw_message, reply
+            )
+            await self._reply(event, reply)
+            await self._remember(event, "clarification_requested", business_event.entities)
+            return
+
+        if not reply:
+            reply = f"Recorded. {business_event.to_summary()}"
+        await self._reply(event, reply)
+        await self._remember(
+            event,
+            business_event.event_type.value if business_event.event_type else "unknown",
+            business_event.entities,
+        )
+        await self._update_customer_memory(business_event)
+
+        # Piggyback the overdue-reminder check on real owner activity.
+        from tasks.reminder_sender import send_overdue_reminders as _send_reminders
+        _spawn(
+            _send_reminders(self.wa_client, self.repo, self.org_id),
+            name=f"overdue_reminders:{self.org_id}",
+        )
+
+    async def _update_customer_memory(self, business_event) -> None:
+        customer_id = getattr(business_event, "customer_id", None)
+        if not customer_id:
+            return
+        payload = business_event.to_storable()
+        if self.mem_repo is not None:
+            try:
+                from services.memory.memory_engine import update_from_event
+                await update_from_event(payload, self.org_id, self.mem_repo, self.repo)
+            except Exception as exc:
+                logger.warning("customer_memory_update_failed", extra={"error": str(exc)})
+        if self.customer_memory_svc is not None:
+            try:
+                await asyncio.to_thread(
+                    self.customer_memory_svc.apply_customer_event,
+                    self.org_id,
+                    customer_id,
+                    business_event.customer_name or "",
+                    business_event.event_type.value,
+                    business_event.entities,
+                )
+            except Exception as exc:
+                logger.warning("customer_profile_update_failed", extra={"error": str(exc)})
+
+    # ── Pending answers ───────────────────────────────────────────────────────
+
+    async def _handle_approval_reply(self, event: MessageEvent, pending: dict) -> bool:
+        """Owner answered a YES/NO approval question. Returns True if handled."""
+        from domain.events.business_event import BusinessEvent, ProcessingStatus
+
+        answer = _yes_no(event.text or "")
+        ctx = pending.get("pending_context") or {}
+        await self.pending_mgr.clear_pending(event.sender_id)
+
+        if answer is None:
+            # Not an answer — leave the paused item unconfirmed and treat this
+            # as a new message.
+            await self._reply(event, "ℹ️ I've left the previous item unconfirmed.")
+            return False
+
+        try:
+            business_event = BusinessEvent(**(ctx.get("event") or {}))
+        except Exception as exc:
+            logger.error("pending_approval_event_invalid", extra={"error": str(exc)})
+            await self._reply(event, "⚠️ I couldn't find the item you're confirming. Please send it again.")
+            return True
+
+        action = ctx.get("action") or ""
+        completed = list(ctx.get("completed") or [])
+
+        if answer:
+            result = await self._dispatch(business_event, approved_actions={action}, skip_actions=completed)
+            await self._after_dispatch(event, business_event, result)
+            return True
+
+        # NO
+        if action == "update_ledger":
+            business_event.processing_status = ProcessingStatus.CANCELLED
+            try:
+                await _repo_call(self.repo.save_business_event, self.org_id, business_event.to_storable())
+            except Exception as exc:
+                logger.warning("cancelled_event_persist_failed", extra={"error": str(exc)})
+            await self._reply(event, "👍 Okay, I didn't record it.")
+            await self._remember(event, "approval_declined", business_event.entities)
+            return True
+
+        # Declining one step (e.g. closing a promise) still lets the rest run.
+        result = await self._dispatch(business_event, skip_actions=completed + [action])
+        await self._after_dispatch(event, business_event, result)
+        return True
+
+    async def _handle_reminder_ack(self, event: MessageEvent, pending: dict) -> bool:
+        """Owner answered a payment reminder. Returns True if handled."""
+        answer = _yes_no(event.text or "")
+        ctx = pending.get("pending_context") or {}
+        await self.pending_mgr.clear_pending(event.sender_id)
+        if answer is None:
+            return False  # e.g. "Brian paid 30k" — process it as a normal message
+        if answer is False:
+            await self._reply(event, "👍 Okay, I'll keep it open and include it in your morning briefing.")
+            return True
+
+        from tasks.reminder_sender import mark_reminders_settled
+        settled = await mark_reminders_settled(self.repo, self.org_id, ctx.get("reminder_ids") or [], event.sender_id)
+        if not settled:
+            await self._reply(event, "👍 Noted — I couldn't find an open reminder to close, so nothing changed.")
+            return True
+        lines = ["✅ *Marked as paid*"]
+        for item in settled[:10]:
+            amt = f" — UGX {item['amount']:,.0f}" if item.get("amount") else ""
+            lines.append(f"  • {item['debtor']}{amt}")
+        await self._reply(event, "\n".join(lines))
+        return True
+
+    # ── Owner questions ───────────────────────────────────────────────────────
+
+    async def _answer_query(self, event: MessageEvent, business_event) -> None:
+        entities = business_event.entities or {}
+        query_type = str(entities.get("query_type") or "").lower()
+        lowered = (event.text or "").lower()
+        if not query_type:
+            if _mentions(lowered, ("owe", "owes", "debt", "debts", "balance", "owing")):
+                query_type = "debts"
+            elif _mentions(lowered, ("recent", "last", "latest")):
+                query_type = "recent"
+            else:
+                query_type = "summary"
+
+        if query_type in ("debts", "customer_balance"):
+            name = entities.get("customer") or entities.get("debtor") or entities.get("payer")
+            if not name and query_type == "customer_balance":
+                name = _extract_debt_name_query(event.text or "")
+            await self._send_debt_info(event, name if query_type == "customer_balance" or name else None)
+        elif query_type == "recent":
+            await self._send_recent_transactions(event)
+        else:
+            await self._send_summary(event)
+
     async def _handle_simple_commands(self, event: MessageEvent, business_event, context: dict) -> bool:
         """
-        Handle greetings, summaries, help, and debt queries that don't need
-        ActionDispatcher.  Returns True if handled, False to continue dispatch.
+        Greetings, help, and keyword shortcuts. Only used when the model could
+        not classify the message (UNKNOWN) — e.g. "hi", or when every LLM
+        provider is down and "summary" should still work.
         """
         from domain.events.event_types import EventType
 
-        if business_event.event_type == EventType.UNKNOWN and event.text:
-            lowered = event.text.lower().strip()
+        if business_event.event_type != EventType.UNKNOWN or not event.text:
+            return False
+        lowered = event.text.lower().strip()
 
-            if _mentions(lowered, ("hello", "hi", "hey", "good morning", "good afternoon")):
-                await self._reply(
-                    event,
-                    f"👋 Hello {event.display_sender}! I'm SenteFlow AI.\n\n"
-                    "Here's what I can do:\n"
-                    "• 📸 Send a receipt photo → I'll extract the transaction\n"
-                    "• 🎤 Send a voice note → I'll transcribe and record it\n"
-                    "• ✍️ Text me: \"Brian paid 50k for feed\" → I'll record it\n"
-                    "• 📊 Text \"summary\" → I'll send your financial overview\n"
-                    "• 📋 Text \"recent\" → I'll list recent transactions",
-                )
-                return True
+        if _mentions(lowered, ("hello", "hi", "hey", "good morning", "good afternoon", "good evening")):
+            await self._reply(
+                event,
+                f"👋 Hello {event.display_sender}! I'm SenteFlow AI.\n\n"
+                "Here's what I can do:\n"
+                "• ✍️ Tell me what happened: \"Brian paid 50k for feed\"\n"
+                "• 📸 Send a receipt or MoMo screenshot → I'll record it\n"
+                "• 🎤 Send a voice note → I'll transcribe and record it\n"
+                "• 📊 Ask \"summary\" or \"who owes me?\"",
+            )
+            return True
 
-            if _mentions(lowered, ("summary", "summarize", "summarise")):
-                await self._send_summary(event)
-                return True
+        if _mentions(lowered, ("summary", "summarize", "summarise")):
+            await self._send_summary(event)
+            return True
 
-            if _mentions(lowered, ("recent",)) or "last transactions" in lowered:
-                await self._send_recent_transactions(event)
-                return True
+        if _mentions(lowered, ("recent",)) or "last transactions" in lowered:
+            await self._send_recent_transactions(event)
+            return True
 
-            if _mentions(lowered, ("debt", "debts", "owes", "owe")):
-                await self._send_debt_info(event, event.text)
-                return True
+        if _mentions(lowered, ("debt", "debts", "owes", "owe")):
+            await self._send_debt_info(event, _extract_debt_name_query(event.text))
+            return True
 
-            if _mentions(lowered, ("help",)) or "what can you do" in lowered:
-                await self._reply(
-                    event,
-                    "💡 *SenteFlow AI Help*\n\n"
-                    "*Record a transaction:*\n"
-                    "• Send a receipt photo\n"
-                    "• Send a voice note describing the transaction\n"
-                    "• Type: \"John paid 200k for bags\"\n\n"
-                    "*Get reports:*\n"
-                    "• Type \"summary\" for financial overview\n"
-                    "• Type \"recent\" for last 10 transactions\n"
-                    "• Type \"debt [name]\" to check someone's balance",
-                )
-                return True
+        if _mentions(lowered, ("help",)) or "what can you do" in lowered:
+            await self._reply(
+                event,
+                "💡 *SenteFlow AI Help*\n\n"
+                "*Record things:*\n"
+                "• \"John paid 200k for bags\"\n"
+                "• \"Sarah took 3 bags on credit, will pay Friday\"\n"
+                "• \"Bought fuel 40k\"\n"
+                "• Send a receipt photo or a voice note\n\n"
+                "*Ask:*\n"
+                "• \"summary\" — financial overview\n"
+                "• \"recent\" — last 10 transactions\n"
+                "• \"who owes me?\" or \"how much does Brian owe?\"",
+            )
+            return True
 
         return False
 
-    # ── Legacy Media Extraction ───────────────────────────────────────────────
+    # ── Receipts & documents ──────────────────────────────────────────────────
 
     async def _process_media_extraction(self, event: MessageEvent, source_hint: str) -> None:
         from integrations.whatsapp.media_handler import save_whatsapp_media
@@ -419,134 +634,117 @@ class MessageRouter:
         from workflows.media_extraction_workflow import run_media_extraction
         from services.responses.reply_generator import generate_extraction_reply
 
-        async def record_transaction_batch(transactions, org_id, sender_id, session_id, repo):
-            ids = []
-            for txn in transactions:
-                record = txn if isinstance(txn, dict) else txn.model_dump(mode="json")
-                record.setdefault("event_type", "expense_recorded")
-                record["sender_id"] = sender_id
-                record["recorded_by"] = sender_id
-                record["upload_session_id"] = session_id
-                record["source"] = "whatsapp"
-                ids.append(await _maybe_await(repo.save_business_event(org_id, record)))
-            return ids
-
-        if not event.media_url:
+        if not event.media_url and not event.message_id:
             await self._reply(event, "⚠️ Couldn't access the media. Please try sending again.")
             return
 
-        # FIX (v2): catch MediaDownloadError explicitly for a user-friendly message
+        label = {MessageType.IMAGE: "📸 image", MessageType.DOCUMENT: "📄 document"}.get(event.message_type, "file")
+        await self._reply(event, f"Got your {label}, {event.display_sender}! Processing...")
+
         try:
             file_path = await save_whatsapp_media(event, self.wa_client)
         except MediaDownloadError as exc:
             logger.error(
                 "media_download_failed",
-                extra={"error": str(exc), "sender": event.sender_id, "url": str(event.media_url)[:80]},
+                extra={"error": str(exc), "sender": event.sender_id, "message_id": event.message_id},
             )
             await self._reply(
                 event,
-                "⚠️ I couldn't download that file from WhatsApp. "
-                "This sometimes happens when the file takes too long to reach me. "
-                "Please try sending it again.",
+                "⚠️ I couldn't download that file from WhatsApp. Please try sending it again.",
             )
             return
         if not file_path:
             await self._reply(event, "⚠️ Couldn't save the media locally. Please try again.")
             return
 
-        media_id = await _maybe_await(self.repo.save_media_asset(self.org_id, {
-            "media_id": event.message_id,
-            "sender_id": event.sender_id,
-            "chat_id": event.chat_id,
-            "event_id": event.event_id,
-            "message_type": event.message_type.value,
-            "mime_type": event.media_mime_type,
-            "filename": event.media_filename,
-            "storage_path": file_path,
-            "source_hint": source_hint,
-            "extraction_status": "processing",
-            "metadata": {"timestamp": event.timestamp.isoformat(), "caption": event.text},
-        }))
-
+        media_id = event.message_id
         try:
+            media_id = await _repo_call(self.repo.save_media_asset, self.org_id, {
+                "media_id": event.message_id,
+                "sender_id": event.sender_id,
+                "chat_id": event.chat_id,
+                "event_id": event.event_id,
+                "message_type": event.message_type.value,
+                "mime_type": event.media_mime_type,
+                "filename": event.media_filename,
+                "storage_path": file_path,
+                "source_hint": source_hint,
+                "extraction_status": "processing",
+                "metadata": {"timestamp": event.timestamp.isoformat(), "caption": event.text},
+            })
+
             filename = event.media_filename or f"{source_hint}_{event.event_id}"
-            # run_media_extraction is synchronous and CPU/network bound —
-            # to_thread keeps it off the event loop.
-            result, session_id = await asyncio.to_thread(
-                run_media_extraction, file_path, filename
+            # run_media_extraction is synchronous and CPU/network bound.
+            result, session_id = await asyncio.to_thread(run_media_extraction, file_path, filename)
+
+            if not result.transactions:
+                await _repo_call(self.repo.save_media_asset, self.org_id, {
+                    "media_id": media_id,
+                    "extraction_status": "empty",
+                    "extracted_entities": [],
+                })
+                await self._reply(
+                    event,
+                    f"I processed your {source_hint.replace('_', ' ')} but couldn't find any clear "
+                    "transactions. Try a clearer image or describe the transaction in text.",
+                )
+                return
+
+            saved_ids = await asyncio.to_thread(
+                self._record_extracted_transactions, result.transactions, event, session_id
             )
+            await _repo_call(self.repo.save_media_asset, self.org_id, {
+                "media_id": media_id,
+                "extraction_status": "completed",
+                "related_transaction_ids": saved_ids,
+                "extracted_entities": [txn.model_dump(mode="json") for txn in result.transactions],
+                "summary": result.summary,
+                "language": result.language_detected,
+            })
+
+            reply = await generate_extraction_reply(result, saved_ids)
+            await self._remember(event, "receipt", {
+                "transaction_ids": saved_ids,
+                "confidence": result.confidence,
+                "summary": result.summary,
+            })
+            await self._reply(event, reply)
         except Exception as exc:
             logger.error("extraction_failed", extra={"error": str(exc), "sender": event.sender_id})
-            await _maybe_await(self.repo.save_media_asset(self.org_id, {
-                "media_id": media_id,
-                "extraction_status": "failed",
-                "last_error": str(exc),
-            }))
+            try:
+                await _repo_call(self.repo.save_media_asset, self.org_id, {
+                    "media_id": media_id,
+                    "extraction_status": "failed",
+                    "last_error": str(exc)[:500],
+                })
+            except Exception:
+                pass
             await self._reply(event, "❌ I had trouble processing that. Please try again or send a clearer image.")
-            return
 
-        if not result.transactions:
-            await _maybe_await(self.repo.save_media_asset(self.org_id, {
-                "media_id": media_id,
-                "extraction_status": "empty",
-                "extracted_entities": [],
-            }))
-            await self._reply(
-                event,
-                f"I processed your {source_hint.replace('_', ' ')} but couldn't find any clear "
-                "transactions. Try a clearer image or describe the transaction in text.",
-            )
-            return
+    def _record_extracted_transactions(self, transactions, event: MessageEvent, session_id: str) -> list[str]:
+        """
+        Save transactions read from a receipt/document. The owner sent the
+        file, so the entries are approved by them; duplicates of entries
+        already recorded are skipped.
+        """
+        from services.ledger import prepare_extracted_records
 
-        saved_ids = await record_transaction_batch(
-            result.transactions, self.org_id, event.sender_id, session_id, self.repo
-        )
-        await _maybe_await(self.repo.save_media_asset(self.org_id, {
-            "media_id": media_id,
-            "extraction_status": "completed",
-            "related_transaction_ids": saved_ids,
-            "extracted_entities": [txn.model_dump(mode="json") for txn in result.transactions],
-            "summary": result.summary,
-            "language": result.language_detected,
-        }))
+        records = []
+        for txn in transactions:
+            record = txn if isinstance(txn, dict) else txn.model_dump(mode="json")
+            record["source"] = "whatsapp"
+            records.append(record)
+        records = prepare_extracted_records(self.repo, self.org_id, records, recorded_by=event.sender_id)
+        approver = f"whatsapp:{event.sender_id.split('@')[0]}"
+        saved_ids, _skipped = self.repo.save_approved_batch(records, self.org_id, approver, session_id)
+        return saved_ids
 
-        try:
-            from services.conversation import ConversationStateManager, EntityLinker
-            conversation = await _maybe_await(ConversationStateManager(self.repo, self.org_id).record_media_processed(
-                sender_id=event.sender_id,
-                event_id=event.event_id,
-                media_id=media_id,
-                transaction_ids=saved_ids,
-                summary=result.summary,
-            ))
-            await _maybe_await(EntityLinker(self.repo, self.org_id).link_media_extraction(
-                sender_id=event.sender_id,
-                event_id=event.event_id,
-                media_id=media_id,
-                transaction_ids=saved_ids,
-                active_order_id=conversation.get("active_order_id"),
-            ))
-        except Exception as exc:
-            logger.warning("media_relationship_update_failed", extra={"error": str(exc), "media_id": media_id})
-
-        reply = await generate_extraction_reply(result, saved_ids)
-        await self._remember(event, "receipt", {
-            "transaction_ids": saved_ids,
-            "confidence": result.confidence,
-            "summary": result.summary,
-        })
-        await self._reply(event, reply)
-
-    # ── Report Helpers ────────────────────────────────────────────────────────
-
-    # The repository is synchronous. `_maybe_await` keeps these helpers working
-    # against either a sync repo or a future async one — awaiting the sync one
-    # directly raises TypeError and turns every report into an error reply.
+    # ── Report helpers ────────────────────────────────────────────────────────
 
     async def _send_summary(self, event: MessageEvent) -> None:
         from services.responses.reply_generator import generate_summary_reply
         try:
-            summary = await _maybe_await(self.repo.compute_financial_summary(self.org_id))
+            summary = await _repo_call(self.repo.compute_financial_summary, self.org_id)
             await self._reply(event, generate_summary_reply(summary))
         except Exception as exc:
             logger.error("summary_failed", extra={"error": str(exc)})
@@ -555,29 +753,31 @@ class MessageRouter:
     async def _send_recent_transactions(self, event: MessageEvent) -> None:
         from services.responses.reply_generator import generate_recent_reply
         try:
-            transactions = await _maybe_await(self.repo.list_transactions(self.org_id, limit=10))
+            transactions = await _repo_call(self.repo.list_transactions, self.org_id, limit=60)
             await self._reply(event, generate_recent_reply(transactions))
         except Exception as exc:
             logger.error("recent_transactions_failed", extra={"error": str(exc)})
             await self._reply(event, "⚠️ Couldn't fetch transactions right now.")
 
-    async def _send_debt_info(self, event: MessageEvent, text: str) -> None:
+    async def _send_debt_info(self, event: MessageEvent, name_query: Optional[str]) -> None:
         from services.responses.reply_generator import generate_debt_reply
-        name_query = _extract_debt_name_query(text)
+        from repositories.transaction_repository import SUMMARY_EVENT_LIMIT
         try:
-            transactions = await _maybe_await(self.repo.list_transactions(self.org_id))
-            await self._reply(event, generate_debt_reply(transactions, name_query))
+            transactions = await _repo_call(self.repo.list_transactions, self.org_id, limit=SUMMARY_EVENT_LIMIT)
+            promises = []
+            lister = getattr(self.repo, "list_open_promises", None)
+            if lister is not None:
+                promises = await _repo_call(lister, self.org_id)
+            await self._reply(event, generate_debt_reply(transactions, name_query, promises))
         except Exception as exc:
             logger.error("debt_info_failed", extra={"error": str(exc)})
             await self._reply(event, "⚠️ Couldn't fetch debt information right now.")
 
-    # ── Reply / Memory Helpers ────────────────────────────────────────────────
+    # ── Reply / memory helpers ────────────────────────────────────────────────
 
     async def _reply(self, event: MessageEvent, text: str) -> None:
-        # Voice-aware reply: if the inbound message was a voice note (or any
-        # audio message), reply with a synthesized voice note via ElevenLabs
-        # instead of plain text. Falls back to text automatically when
-        # ELEVENLABS_API_KEY is not set or synthesis fails.
+        # Voice-aware reply: if the owner sent a voice note, answer with one
+        # (ElevenLabs), falling back to text automatically.
         inbound_was_voice = event.message_type in (MessageType.VOICE, MessageType.AUDIO)
         try:
             from integrations.whatsapp.reply_sender import send_voice_aware
@@ -593,7 +793,8 @@ class MessageRouter:
     async def _remember(self, event: MessageEvent, intent: str, data: dict | None = None) -> None:
         try:
             from memory.conversation_memory import ConversationMemory
-            ConversationMemory(self.repo, self.org_id).remember_message(
+            await asyncio.to_thread(
+                ConversationMemory(self.repo, self.org_id).remember_message,
                 sender_id=event.sender_id,
                 event_id=event.event_id,
                 text=event.text,
@@ -613,6 +814,11 @@ class MessageRouter:
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
 
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
 # Words that carry no signal when the owner asks about someone's balance.
 # Stripping only the command keyword left filler like "who" in the query, so
 # "who owes brian" searched for the customer "who brian" and always missed.
@@ -620,7 +826,8 @@ _DEBT_QUERY_STOPWORDS = frozenset({
     "debt", "debts", "owe", "owes", "owed", "owing", "who", "whos", "who's",
     "what", "whats", "what's", "how", "much", "is", "are", "the", "my", "me",
     "show", "list", "check", "tell", "does", "do", "for", "of", "on", "to",
-    "balance", "outstanding", "still", "and", "a", "an", "any",
+    "balance", "outstanding", "still", "and", "a", "an", "any", "money", "i",
+    "us", "please", "all",
 })
 
 
@@ -633,18 +840,18 @@ def _extract_debt_name_query(text: str) -> str | None:
 
 
 def _format_memory_for_prompt(interactions: list[dict]) -> str:
-    """Gap 4: Convert recent interactions into a prompt-friendly string."""
+    """Convert recent interactions into a prompt-friendly string."""
     if not interactions:
         return "No prior interactions."
     lines = []
     for i in interactions[:5]:
-        ts = i.get("timestamp", "")[:16]   # trim to minute precision
+        ts = str(i.get("timestamp") or "")[:16]   # trim to minute precision
         intent = i.get("intent", "?")
         msg = i.get("message") or ""
         extracted = i.get("extracted") or {}
         detail = ""
-        if extracted.get("payer") or extracted.get("payee"):
-            person = extracted.get("payer") or extracted.get("payee")
+        person = extracted.get("customer") or extracted.get("payer") or extracted.get("payee")
+        if person:
             amount = extracted.get("amount")
             detail = f" ({person}" + (f", {amount}" if amount else "") + ")"
         lines.append(f"- [{ts}] {intent}{detail}: {msg[:80]}")

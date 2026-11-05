@@ -4,13 +4,12 @@ SenteFlow AI — Media Extraction Workflow
 Turns a saved media file (receipt photo, voice note, PDF, text) into an
 ExtractionResult plus the session id that groups everything extracted from it.
 
-This is the file-oriented counterpart to event_extraction_workflow, which works
-on already-transcribed text. Both the WhatsApp media path and the /extract HTTP
-route call in here so they produce identically shaped results.
+Both the WhatsApp receipt/document path and the /extract HTTP route call in
+here so they produce identically shaped results. (WhatsApp voice notes are
+transcribed and handled as text messages instead — see message_router.)
 
-The AI calls in ai/extractor are synchronous (the google-genai client blocks),
-so this workflow is synchronous too. Async callers should hand it to
-`asyncio.to_thread` rather than awaiting it.
+The AI calls in ai/extractor are synchronous, so this workflow is synchronous
+too. Async callers should hand it to `asyncio.to_thread` rather than awaiting it.
 """
 
 import logging

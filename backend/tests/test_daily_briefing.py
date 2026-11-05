@@ -1,146 +1,120 @@
 """
-Tests for _daily_briefing_loop in main.py — covers:
-- Correct argument types passed to operational_intelligence functions (Bug 1)
-- Correct "trend" key used instead of "direction" (Bug 2)
-- Sleep-after-work (first briefing fires immediately)
+Tests for the morning briefing (tasks/briefing.py):
+- the detect_* functions receive lists, not (repo, org_id)
+- the revenue line reads the "trend" key
+- sent once per business per day, after BRIEFING_HOUR, to the owners' numbers
+- a failed send releases the day's claim so it is retried
 """
-import asyncio
+from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
-from unittest.mock import MagicMock, AsyncMock, patch, call
+
+from tasks import briefing
 
 
-def _make_repo(events=None, customers=None):
+def _make_repo(events=None, customers=None, promises=None):
     repo = MagicMock()
     repo.list_transactions.return_value = events or []
     repo.list_customers.return_value = customers or []
+    repo.list_open_promises.return_value = promises or []
     return repo
 
 
-@pytest.mark.asyncio
-async def test_briefing_calls_detect_functions_with_lists():
-    """
-    operational_intelligence functions expect list[dict], not (repo, org_id).
-    The briefing loop must fetch data first, then pass lists to the functions.
-    """
-    from main import _daily_briefing_loop
+class FakeTenants:
+    def __init__(self, phones=("256700000000",)):
+        self._phones = list(phones)
 
-    repo = _make_repo(events=[{"event_type": "payment_promise", "entities": {"amount": 50000}}])
-    wa_client = AsyncMock()
+    def owner_phones(self, org_id):
+        return self._phones
 
-    detect_calls = {}
-
-    def fake_detect_overdue(events):
-        assert isinstance(events, list), f"Expected list, got {type(events)}"
-        detect_calls["overdue"] = True
-        return []
-
-    def fake_detect_lost(customers, days_threshold=45):
-        assert isinstance(customers, list), f"Expected list, got {type(customers)}"
-        detect_calls["lost"] = True
-        return []
-
-    def fake_detect_inv(events):
-        assert isinstance(events, list), f"Expected list, got {type(events)}"
-        detect_calls["inv"] = True
-        return []
-
-    def fake_detect_rev(events):
-        assert isinstance(events, list), f"Expected list, got {type(events)}"
-        detect_calls["rev"] = True
-        return {"trend": "up", "change_percent": 12.5, "this_week": 1000, "last_week": 890}
-
-    with patch("services.memory.operational_intelligence.detect_overdue_debts", side_effect=fake_detect_overdue), \
-         patch("services.memory.operational_intelligence.detect_lost_customers", side_effect=fake_detect_lost), \
-         patch("services.memory.operational_intelligence.detect_inventory_risk", side_effect=fake_detect_inv), \
-         patch("services.memory.operational_intelligence.detect_revenue_trends", side_effect=fake_detect_rev), \
-         patch.dict("os.environ", {"DEFAULT_OWNER_PHONE": "+256700000000"}):
-
-        # Run one iteration (cancel after first sleep)
-        task = asyncio.create_task(
-            _daily_briefing_loop(wa_client, repo, "org-1", interval_hours=0.0001)
-        )
-        await asyncio.sleep(0.05)
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-    # All four detect functions should have been called
-    assert "overdue" in detect_calls
-    assert "lost" in detect_calls
-    assert "inv" in detect_calls
-    assert "rev" in detect_calls
+    def list_org_ids(self):
+        return ["org-1"]
 
 
-@pytest.mark.asyncio
-async def test_briefing_uses_trend_key_not_direction():
-    """
-    detect_revenue_trends() returns {"trend": "up"} — not {"direction": "up"}.
-    The briefing loop must read the "trend" key.
-    """
-    from main import _daily_briefing_loop
+def test_build_briefing_passes_lists_to_detectors():
+    seen = {}
 
-    repo = _make_repo()
-    wa_client = AsyncMock()
+    def _rec(name, ret):
+        def fn(data, *a, **k):
+            assert isinstance(data, list), f"{name} got {type(data)}"
+            seen[name] = True
+            return ret
+        return fn
 
-    trend_result = {"trend": "up", "change_percent": 20.0, "this_week": 1200, "last_week": 1000}
-    # Note: no "direction" key — if the loop still reads "direction", the emoji won't appear
+    with patch("services.memory.operational_intelligence.detect_overdue_debts", side_effect=_rec("overdue", [])), \
+         patch("services.memory.operational_intelligence.detect_lost_customers", side_effect=_rec("lost", [])), \
+         patch("services.memory.operational_intelligence.detect_inventory_risk", side_effect=_rec("inv", [])), \
+         patch("services.memory.operational_intelligence.detect_revenue_trends",
+               side_effect=_rec("rev", {"trend": "up", "change_percent": 12.5})):
+        msg = briefing.build_briefing(_make_repo(), "org-1")
 
+    assert seen == {"overdue": True, "lost": True, "inv": True, "rev": True}
+    assert msg and "📈" in msg
+
+
+def test_build_briefing_uses_trend_key():
     with patch("services.memory.operational_intelligence.detect_overdue_debts", return_value=[]), \
          patch("services.memory.operational_intelligence.detect_lost_customers", return_value=[]), \
          patch("services.memory.operational_intelligence.detect_inventory_risk", return_value=[]), \
-         patch("services.memory.operational_intelligence.detect_revenue_trends", return_value=trend_result), \
-         patch.dict("os.environ", {"DEFAULT_OWNER_PHONE": "+256700000000"}):
+         patch("services.memory.operational_intelligence.detect_revenue_trends",
+               return_value={"trend": "down", "change_percent": -20.0}):
+        msg = briefing.build_briefing(_make_repo(), "org-1")
+    assert "📉" in msg and "20.0%" in msg
 
-        task = asyncio.create_task(
-            _daily_briefing_loop(wa_client, repo, "org-1", interval_hours=0.0001)
-        )
-        await asyncio.sleep(0.05)
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
 
-    # wa_client.send_text should have been called with a message that contains revenue emoji
-    wa_client.send_text.assert_called()
-    sent_msg = wa_client.send_text.call_args[0][1]
-    assert "📈" in sent_msg, f"Expected 📈 in briefing message but got: {sent_msg}"
+def test_build_briefing_none_when_nothing_to_report():
+    with patch("services.memory.operational_intelligence.detect_revenue_trends",
+               return_value={"trend": "stable", "change_percent": 0}):
+        assert briefing.build_briefing(_make_repo(), "org-1") is None
+
+
+def test_overdue_promise_with_due_at_is_reported():
+    promises = [{
+        "type": "payment_promise",
+        "status": "pending",
+        "due_at": "2020-01-01T20:00:00",
+        "entities": {"customer": "Bob", "amount": 10000},
+    }]
+    msg = briefing.build_briefing(_make_repo(promises=promises), "org-1")
+    assert msg and "Bob" in msg and "10,000" in msg
 
 
 @pytest.mark.asyncio
-async def test_briefing_fires_immediately_not_after_sleep():
-    """
-    The loop should send the briefing on its FIRST iteration (before sleeping),
-    not after a full 24h wait.
-    """
-    from main import _daily_briefing_loop
+async def test_not_sent_before_briefing_hour():
+    wa = AsyncMock()
+    early = datetime(2026, 11, 5, 5, 0)
+    with patch.dict("os.environ", {"BRIEFING_HOUR": "7"}):
+        sent = await briefing.send_briefing_for_org(wa, _make_repo(), FakeTenants(), "org-1", now=early)
+    assert sent is False
+    wa.send_text.assert_not_called()
 
-    repo = _make_repo(events=[
-        {"event_type": "payment_promise", "entities": {"debtor": "Bob", "amount": 10000}, "created_at": "2026-01-01T00:00:00"}
-    ])
-    wa_client = AsyncMock()
 
-    with patch("services.memory.operational_intelligence.detect_overdue_debts",
-               return_value=[{"debtor": "Bob", "amount": 10000, "days_overdue": 3}]), \
-         patch("services.memory.operational_intelligence.detect_lost_customers", return_value=[]), \
-         patch("services.memory.operational_intelligence.detect_inventory_risk", return_value=[]), \
-         patch("services.memory.operational_intelligence.detect_revenue_trends",
-               return_value={"trend": "stable", "change_percent": 0}), \
-         patch.dict("os.environ", {"DEFAULT_OWNER_PHONE": "+256700000000"}):
+@pytest.mark.asyncio
+async def test_sent_once_to_each_owner_after_hour():
+    wa = AsyncMock()
+    wa.send_text.return_value = {"key": {"id": "x"}}
+    now = datetime(2026, 11, 5, 8, 0)
+    with patch.object(briefing, "claim_briefing", side_effect=[True, False]), \
+         patch.object(briefing, "build_briefing", return_value="Good morning!"), \
+         patch.dict("os.environ", {"BRIEFING_HOUR": "7"}):
+        first = await briefing.send_briefing_for_org(wa, _make_repo(), FakeTenants(["256700000001", "256700000002"]), "org-1", now=now)
+        second = await briefing.send_briefing_for_org(wa, _make_repo(), FakeTenants(["256700000001", "256700000002"]), "org-1", now=now)
+    assert first is True and second is False
+    assert wa.send_text.call_count == 2
+    assert wa.send_text.call_args_list[0][0][0] == "256700000001@s.whatsapp.net"
 
-        # A very short interval — but we check the message was sent BEFORE the sleep ends
-        task = asyncio.create_task(
-            _daily_briefing_loop(wa_client, repo, "org-1", interval_hours=10)
-        )
-        # Give it a moment to run (not anywhere near 10h)
-        await asyncio.sleep(0.05)
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
 
-    # The send should have happened in the first iteration, not after 10 hours
-    wa_client.send_text.assert_called()
+@pytest.mark.asyncio
+async def test_failed_send_releases_claim():
+    wa = AsyncMock()
+    wa.send_text.return_value = {"error": "connection refused"}
+    now = datetime(2026, 11, 5, 8, 0)
+    with patch.object(briefing, "claim_briefing", return_value=True), \
+         patch.object(briefing, "build_briefing", return_value="Good morning!"), \
+         patch.object(briefing, "release_briefing") as release, \
+         patch.dict("os.environ", {"BRIEFING_HOUR": "7"}):
+        sent = await briefing.send_briefing_for_org(wa, _make_repo(), FakeTenants(), "org-1", now=now)
+    assert sent is False
+    release.assert_called_once()
+    assert release.call_args[0][1:] == ("org-1", "2026-11-05")

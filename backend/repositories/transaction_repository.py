@@ -11,6 +11,8 @@ New code should use the specific repositories directly:
   - MemoryRepository      → organizations/{org_id}/memory
 """
 
+
+from __future__ import annotations
 import hashlib
 import logging
 import re
@@ -28,6 +30,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _UNSAFE_DOC_ID = re.compile(r"[^A-Za-z0-9_.\-]")
+
+# How many events the summary and balance views read. Large enough for a
+# typical SME's history; raise it (or move to stored running totals) as data grows.
+SUMMARY_EVENT_LIMIT = 2000
 
 
 def _safe_doc_id(raw: str) -> str:
@@ -201,7 +207,7 @@ class TransactionRepository:
         """
         from domain.models import FinancialSummary
 
-        events = self.list_transactions(org_id, limit=500)
+        events = self.list_transactions(org_id, limit=SUMMARY_EVENT_LIMIT)
 
         def _amount(e: dict) -> float:
             try:
@@ -211,6 +217,8 @@ class TransactionRepository:
 
         def _type(e: dict) -> str:
             return e.get("event_type") or e.get("transaction_type") or e.get("type") or ""
+
+        events = [e for e in events if e.get("status") != "rejected"]
 
         sale_types = {"sale", "customer_order", "order_received", "income"}
         expense_types = {"expense", "expense_recorded"}
@@ -388,6 +396,25 @@ class TransactionRepository:
         ordered = sorted(timeline, key=lambda e: str(e.get("timestamp") or ""), reverse=True)
         return ordered[:limit] if limit else ordered
 
+    def append_interaction(self, org_id: str, sender_id: str, entry: dict) -> str:
+        """Owner ↔ SenteFlow message log: conversations/{sender}/interactions/{id}."""
+        doc_id = _safe_doc_id(entry.get("event_id") or str(uuid.uuid4()))
+        (
+            self._col(org_id, "conversations").document(sender_id)
+            .collection("interactions").document(doc_id)
+            .set(entry)
+        )
+        return doc_id
+
+    def list_interactions(self, org_id: str, sender_id: str, limit: int = 10) -> list[dict]:
+        ref = self._col(org_id, "conversations").document(sender_id).collection("interactions")
+        try:
+            docs = ref.order_by("timestamp", direction="DESCENDING").limit(limit).get()
+        except Exception as exc:
+            logger.warning("list_interactions_failed", extra={"error": str(exc)})
+            return []
+        return [d.to_dict() or {} for d in docs]
+
     def get_or_create(self, org_id: str, sender_id: str, name: str = None) -> dict:
         existing = self.get_conversation(org_id, sender_id)
         if existing:
@@ -556,25 +583,92 @@ class TransactionRepository:
 
         Returns True only if this caller won the claim. Returns False when the
         event is already being processed or is finished, so a duplicate
-        delivery cannot run the pipeline a second time.
+        delivery cannot run the pipeline a second time. The read and the
+        status change happen in one Firestore transaction, so two workers
+        cannot both win.
         """
         doc_ref = self._col(org_id, "webhook_queue").document(queue_id)
-        try:
-            doc = doc_ref.get()
-            if not doc.exists:
+
+        def _claim_state(snapshot) -> Optional[dict]:
+            if not snapshot.exists:
                 logger.warning("webhook_claim_missing", extra={"queue_id": queue_id})
-                return False
-            if doc.to_dict().get("status") != "queued":
-                return False
-            doc_ref.update({
+                return None
+            data = snapshot.to_dict() or {}
+            if data.get("status") != "queued":
+                return None
+            return {
                 "status": "processing",
-                "attempts": (doc.to_dict().get("attempts") or 0) + 1,
+                "attempts": (data.get("attempts") or 0) + 1,
                 "started_at": utc_now().isoformat(),
-            })
+            }
+
+        @firestore_transactional
+        def _claim(transaction, ref):
+            updates = _claim_state(ref.get(transaction=transaction))
+            if updates is None:
+                return False
+            transaction.update(ref, updates)
             return True
+
+        try:
+            return bool(_claim(self._db.transaction(), doc_ref))
         except Exception as exc:
-            logger.error("webhook_claim_failed", extra={"queue_id": queue_id, "error": str(exc)})
-            return False
+            logger.warning("webhook_claim_non_transactional", extra={"queue_id": queue_id, "error": str(exc)})
+            try:
+                updates = _claim_state(doc_ref.get())
+                if updates is None:
+                    return False
+                doc_ref.update(updates)
+                return True
+            except Exception as inner:
+                logger.error("webhook_claim_failed", extra={"queue_id": queue_id, "error": str(inner)})
+                return False
+
+    def requeue_stale_webhooks(
+        self,
+        org_id: str,
+        stale_after_minutes: int = 10,
+        max_attempts: int = 3,
+    ) -> list[str]:
+        """
+        Put unfinished webhook events back in the queue.
+
+        - `processing` for longer than `stale_after_minutes`: the worker died
+          (restart, deploy, crash) part-way through.
+        - `failed` with fewer than `max_attempts` attempts.
+
+        Returns the queue ids that were re-queued.
+        """
+        from datetime import datetime, timedelta
+
+        cutoff = utc_now() - timedelta(minutes=stale_after_minutes)
+        requeued: list[str] = []
+        col = self._col(org_id, "webhook_queue")
+        for status in ("processing", "failed"):
+            try:
+                docs = col.where("status", "==", status).limit(100).get()
+            except Exception as exc:
+                logger.warning("webhook_requeue_query_failed", extra={"status": status, "error": str(exc)})
+                continue
+            for d in docs:
+                data = d.to_dict() or {}
+                if (data.get("attempts") or 0) >= max_attempts:
+                    continue
+                if status == "processing":
+                    try:
+                        started = datetime.fromisoformat(str(data.get("started_at") or "").replace("Z", "+00:00"))
+                        if started.tzinfo is not None:
+                            started = started.replace(tzinfo=None)
+                    except ValueError:
+                        started = None
+                    if started is not None and started > cutoff:
+                        continue  # still within its processing window
+                try:
+                    d.reference.update({"status": "queued", "requeued_at": utc_now().isoformat()})
+                    requeued.append(d.id)
+                except Exception as exc:
+                    logger.warning("webhook_requeue_failed", extra={"queue_id": d.id, "error": str(exc)})
+        return requeued
 
     def mark_webhook_completed(self, org_id: str, queue_id: str) -> None:
         self._col(org_id, "webhook_queue").document(queue_id).update({
@@ -588,6 +682,94 @@ class TransactionRepository:
             "error": error,
             "failed_at": utc_now().isoformat(),
         })
+
+    # ── Customers (resolved from message content) ────────────────────────────
+
+    def create_customer(self, org_id: str, display_name: str, phone_number: Optional[str] = None) -> dict:
+        customer_id = f"cust_{uuid.uuid4().hex[:12]}"
+        now = utc_now().isoformat()
+        data = {
+            "customer_id": customer_id,
+            "display_name": display_name,
+            "aliases": [],
+            "phone_number": phone_number,
+            "created_at": now,
+            "last_interaction": now,
+        }
+        self._col(org_id, "customers").document(customer_id).set(data)
+        return {**data, "id": customer_id}
+
+    # ── Commitments: promises + reminders still waiting on a customer ────────
+
+    def list_open_commitments(
+        self,
+        org_id: str,
+        customer_id: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> list[dict]:
+        """
+        Open payment promises and reminders for one customer, matched by
+        customer_id or (for records written before customer resolution
+        existed) by debtor name. Each item carries its collection name.
+        """
+        wanted_name = (name or "").strip().lower()
+        results: list[dict] = []
+        for collection, open_statuses in (("promises", ("pending",)), ("reminders", ("pending", "notified"))):
+            try:
+                docs = self._col(org_id, collection).where("status", "in", list(open_statuses)).get()
+            except Exception as exc:
+                logger.warning("open_commitments_query_failed", extra={"collection": collection, "error": str(exc)})
+                continue
+            for d in docs:
+                data = d.to_dict() or {}
+                entities = data.get("entities") or {}
+                doc_customer = data.get("customer_id") or entities.get("customer_id")
+                doc_name = str(
+                    data.get("debtor") or entities.get("debtor") or entities.get("customer") or ""
+                ).strip().lower()
+                if customer_id and doc_customer == customer_id:
+                    match = True
+                elif wanted_name and doc_name and doc_name == wanted_name:
+                    match = True
+                else:
+                    match = False
+                if match:
+                    results.append({**data, "id": d.id, "_collection": collection})
+        return results
+
+    def resolve_commitments(self, org_id: str, items: list[dict], resolved_by: str = "") -> int:
+        """Mark promises/reminders as resolved. Returns how many were updated."""
+        now = utc_now().isoformat()
+        count = 0
+        for item in items:
+            collection = item.get("_collection")
+            doc_id = item.get("id")
+            if not collection or not doc_id:
+                continue
+            try:
+                self._col(org_id, collection).document(doc_id).update({
+                    "status": "resolved",
+                    "resolved_at": now,
+                    "resolved_by": resolved_by,
+                })
+                count += 1
+            except Exception as exc:
+                logger.warning("commitment_resolve_failed", extra={"id": doc_id, "error": str(exc)})
+        return count
+
+    def list_open_promises(self, org_id: str, limit: int = 500) -> list[dict]:
+        try:
+            docs = self._col(org_id, "promises").where("status", "==", "pending").limit(limit).get()
+        except Exception as exc:
+            logger.warning("open_promises_query_failed", extra={"error": str(exc)})
+            return []
+        return [{**(d.to_dict() or {}), "id": d.id} for d in docs]
+
+    def get_event(self, org_id: str, event_id: str) -> Optional[dict]:
+        doc = self._col(org_id, "events").document(event_id).get()
+        if not doc.exists:
+            return None
+        return {**doc.to_dict(), "id": doc.id}
 
     # ── Debts / Overdue ───────────────────────────────────────────────────────
 

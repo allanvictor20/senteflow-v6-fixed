@@ -2,7 +2,6 @@
 
 import json
 import logging
-import os
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -79,36 +78,36 @@ async def _groq_clarification(
     confidence: float,
     original_text: str,
 ) -> str:
-    """Use Groq to generate a natural clarification question."""
-    from openai import AsyncOpenAI
+    """Ask the LLM (Groq, with Claude/OpenAI fallback) for a natural clarification question."""
+    from services.llm.llm_provider import complete_with_fallback
 
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY not set")
-    client = AsyncOpenAI(
-        api_key=api_key,
-        base_url="https://api.groq.com/openai/v1",
-    )
-    model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
     prompt = (
-        f'The user sent: "{original_text}"\n'
-        f"Extracted so far (confidence {confidence:.0%}): {json.dumps(data)}\n\n"
+        f'The business owner sent: "{original_text}"\n'
+        f"Extracted so far (confidence {confidence:.0%}): {json.dumps(data, default=str)}\n\n"
         "Write a SHORT WhatsApp reply (1-2 lines) that:\n"
         "- Confirms what you understood\n"
         "- Asks ONE specific question about what was unclear\n"
         "- Sounds like a helpful assistant, not a form\n"
         "Return ONLY the reply text."
     )
-    response = await client.chat.completions.create(
-        model=model,
-        max_tokens=100,
-        temperature=0.3,
-        messages=[
-            {"role": "system", "content": "You are a helpful WhatsApp business assistant."},
-            {"role": "user", "content": prompt},
-        ],
+    text, _provider = await complete_with_fallback(
+        prompt=prompt,
+        system="You are a helpful WhatsApp business assistant for a Ugandan small business owner.",
+        max_tokens=400,
     )
-    return (response.choices[0].message.content or "").strip()
+    return text.strip() or "Could you confirm the amount and the person?"
+
+
+async def generate_clarification(data: dict, confidence: float, original_text: str) -> str:
+    """Clarification question for a low-confidence event (never raises)."""
+    try:
+        return await _groq_clarification(data, confidence, original_text)
+    except Exception as exc:
+        logger.warning("clarification_generation_failed", extra={"error": str(exc)})
+        return (
+            "I wasn't completely sure about that. "
+            "Could you confirm the amount and the person?"
+        )
 
 
 # Backward-compatible alias

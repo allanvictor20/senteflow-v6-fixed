@@ -33,18 +33,22 @@ class ConversationStateManager:
         self.org_id = org_id
 
     def apply_business_event(self, event: Any) -> dict[str, Any]:
-        existing = self.repo.get_conversation(self.org_id, event.sender_id) or {}
+        # The business flow (inquiry → order → payment → delivery) belongs to
+        # the CUSTOMER the event is about. The WhatsApp sender is the owner.
+        conv_key = getattr(event, "customer_id", None) or event.sender_id
+        existing = self.repo.get_conversation(self.org_id, conv_key) or {}
         previous_state = self._coerce_state(existing.get("state"))
         transition = self._transition_for_event(event.event_type, previous_state, event.entities)
         active_order_id = (
             event.entities.get("order_id")
             or existing.get("active_order_id")
-            or self._find_open_order(event.sender_id)
+            or self._find_open_order(conv_key)
         )
 
         updates = {
-            "conversation_id": event.sender_id,
-            "customer_id": event.sender_id,
+            "conversation_id": conv_key,
+            "customer_id": conv_key,
+            "customer_name": getattr(event, "customer_name", None),
             "state": transition.state.value,
             "active_order_id": active_order_id,
             "last_intent": transition.last_intent,
@@ -55,7 +59,7 @@ class ConversationStateManager:
             "linked_transaction_id": event.transaction_id,
             "entities": event.entities,
         }
-        self.repo.upsert_conversation(self.org_id, event.sender_id, updates)
+        self.repo.upsert_conversation(self.org_id, conv_key, updates)
 
         timeline_entry = ConversationTimelineEntry(
             event_id=event.event_id,
@@ -68,7 +72,7 @@ class ConversationStateManager:
             confidence=event.confidence,
             summary=event.to_summary(),
         )
-        self.repo.append_conversation_timeline(self.org_id, event.sender_id, timeline_entry.model_dump(mode="json"))
+        self.repo.append_conversation_timeline(self.org_id, conv_key, timeline_entry.model_dump(mode="json"))
         return updates
 
     def record_media_processed(

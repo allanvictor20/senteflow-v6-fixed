@@ -29,6 +29,7 @@ class ProcessingStatus(str, Enum):
     INTERPRETED = "interpreted"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class BusinessEvent(BaseModel):
@@ -67,7 +68,15 @@ class BusinessEvent(BaseModel):
     """Human-readable list of what this event should cause, e.g. ['Update debt balance', 'Send reminder']."""
 
     recommended_actions: list[str] = Field(default_factory=list)
-    """Action keys for the ActionDispatcher, e.g. ['update_ledger', 'schedule_reminder']."""
+    """Explicit action keys for the ActionDispatcher. Empty → the per-event-type defaults run."""
+
+    suggested_actions: list[str] = Field(default_factory=list)
+    """Actions the LLM suggested. Stored for audit only; they do not drive dispatch."""
+
+    customer_id: Optional[str] = None
+    """The customer this event is about (resolved from the message content, not the sender)."""
+
+    customer_name: Optional[str] = None
 
     reasoning: str = ""
     """AI explanation of why this classification was made."""
@@ -124,4 +133,10 @@ class EventResult(BaseModel):
     followup_scheduled: bool = False
     pending_approval: bool = False
     """True when a HIGH-RISK action was held back awaiting owner confirmation."""
+    pending_action: Optional[str] = None
+    """The action key waiting for approval (when pending_approval is True)."""
+    needs_clarification: bool = False
+    """True when a tool could not run without more information from the owner."""
+    completed_actions: list[str] = Field(default_factory=list)
+    """Action keys that already ran — skipped when the event is resumed after approval."""
     error: Optional[str] = None

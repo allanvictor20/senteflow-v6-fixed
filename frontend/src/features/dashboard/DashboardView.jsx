@@ -6,6 +6,15 @@ import KpiCard from "./KpiCard";
 import WhatsAppStatusCard from "./WhatsAppStatusCard";
 import WhatsAppActivityFeed from "./WhatsAppActivityFeed";
 
+function orderLabel(order) {
+  const who = order.customer_name ? `${order.customer_name}: ` : "";
+  if (Array.isArray(order.items) && order.items.length) {
+    const names = order.items.map((i) => (typeof i === "string" ? i : `${i.quantity && i.quantity !== 1 ? i.quantity + " " : ""}${i.name}`));
+    return who + names.join(", ");
+  }
+  return who + (order.raw_message || order.source_message || "Order");
+}
+
 export default function DashboardView({ summary, summaryError, transactions, alerts, orgId }) {
   const [controlData, setControlData] = useState({ orders: [], customers: [], media_assets: [] });
   const [fetchError, setFetchError] = useState(false);
@@ -38,9 +47,12 @@ export default function DashboardView({ summary, summaryError, transactions, ale
       ? total + Number(t.amount || t.entities?.amount || 0)
       : total;
   }, 0);
-  const pendingOrders = controlData.orders.filter((o) => o.status !== "completed");
-  const unpaidOrders = controlData.orders.filter((o) => o.payment_status === "unpaid");
-  const pendingDeliveries = controlData.orders.filter((o) => o.delivery_status === "pending");
+  const CLOSED_ORDER = ["completed", "delivered", "cancelled"];
+  const pendingOrders = controlData.orders.filter((o) => !CLOSED_ORDER.includes(o.status));
+  const unpaidOrders = controlData.orders.filter((o) => o.payment_status === "unpaid" && o.status !== "cancelled");
+  const pendingDeliveries = controlData.orders.filter(
+    (o) => o.status !== "cancelled" && !["delivered", undefined, null].includes(o.delivery_status)
+  );
   const recentMedia = controlData.media_assets.slice(0, 5);
 
   return (
@@ -156,7 +168,7 @@ export default function DashboardView({ summary, summaryError, transactions, ale
                   {order.customer_name || order.customer_id || "Customer"}
                 </div>
                 <div style={{ color: C.textMuted, fontSize: 12, marginTop: 2 }}>
-                  {(order.items || order.source_message || "Order").toString()} · {order.payment_status || "unpaid"} · {order.delivery_status || "pending"}
+                  {orderLabel(order)} · {order.payment_status || "unpaid"} · {(order.delivery_status || "not scheduled").replace("_", " ")}
                 </div>
               </div>
             ))

@@ -77,7 +77,10 @@ def _coerce_entities(raw_entities: Any) -> dict[str, Any]:
 # ─── Base system prompt ───────────────────────────────────────────────────────
 
 _BASE_SYSTEM_PROMPT = """You are a business intelligence engine for Ugandan SME owners using WhatsApp.
-Your job is to extract structured business meaning from casual, often code-switched messages.
+The person messaging you is the BUSINESS OWNER (or their staff). They tell you,
+in their own words, what happened with their customers, suppliers and stock.
+They are never the customer themselves. Your job is to extract structured
+business meaning from casual, often code-switched messages.
 
 Language notes:
 - Luganda: "akuliwa"=received, "ssente"=money, "obuuza"=goods, "okulipa"=to pay, "nkuweereza"=I'm sending
@@ -89,27 +92,44 @@ IMPORTANT — amounts:
 - Always store amounts as plain numbers (50000, not "50k" or "UGX 50,000")
 - If you cannot determine the exact amount, omit the "amount" key entirely
 
+IMPORTANT — people:
+- Put the customer (the other party the owner is talking about) in "customer",
+  using the name exactly as the owner wrote it. Also fill the role key that fits:
+  "payer" for payments received, "debtor" for debts and promises, "supplier"
+  for suppliers. If the owner gives a phone number for them, put it in "phone".
+
+IMPORTANT — dates:
+- Write every date (e.g. "due_date") as YYYY-MM-DD, resolving words like
+  "Friday", "tomorrow" or "end of month" against today's date given below.
+
 Always return valid JSON matching the schema. Use "unknown" event_type if you cannot classify.
 Set confidence between 0.0 (total guess) and 1.0 (certain).
 """
 
-_USER_PROMPT_TEMPLATE = """Extract the business event from this WhatsApp message.
+_USER_PROMPT_TEMPLATE = """Today is {today} ({weekday}) in Uganda.
+
+Extract the business event from this WhatsApp message from the business owner.
 
 Message: "{message}"
 
 {memory_section}{business_context_section}Full context:
 {context_str}
 
-Return JSON with:
+Return a JSON object with:
 - event_type: one of customer_inquiry, customer_order, order_received, negotiation,
   complaint, appointment_request, payment_received, payment_promise, debt_created,
   expense_recorded, delivery_update, inventory_update, low_stock_alert,
-  supplier_message, business_note, follow_up_required, reminder_request, unknown
+  supplier_message, business_note, follow_up_required, reminder_request,
+  business_query, unknown
+  (use business_query when the owner is ASKING about their records, e.g.
+  "who owes me?", "how much did Brian pay?", "send me a summary")
 - confidence: 0.0–1.0
-- entities: relevant key-value facts (amount as a plain number, payer, item, quantity, due_date, etc.)
+- entities: relevant key-value facts (amount as a plain number, customer, payer,
+  debtor, item, quantity, due_date as YYYY-MM-DD, phone, etc.). For business_query
+  also set "query_type" to one of summary, recent, debts, customer_balance and,
+  for customer_balance, "customer".
 - reasoning: one sentence explaining your classification
-- recommended_actions: list of action keys (update_ledger, schedule_reminder, create_alert,
-  notify_owner, update_inventory, record_expense)
+- recommended_actions: list of action keys you think apply (informational only)
 - operational_effects: human-readable list of what should happen
 
 IMPORTANT: Return ONLY JSON, no markdown fences."""
@@ -195,10 +215,24 @@ def _build_business_context_section(context: dict[str, Any]) -> str:
     return "Business-specific context:\n" + "\n".join(f"- {l}" for l in lines) + "\n\n"
 
 
+_MAX_CONTEXT_CHARS = 4000
+
+
 def _build_context_str(context: dict[str, Any]) -> str:
     skip_keys = {"recent_memory", "raw_interactions", "customer_profile", "recent_transactions", "wa_client"}
-    stripped = {k: v for k, v in context.items() if k not in skip_keys}
-    return json.dumps(stripped, indent=2, default=str) if stripped else "None"
+    stripped = {k: v for k, v in context.items() if k not in skip_keys and v not in ({}, [], None, "")}
+    if not stripped:
+        return "None"
+    text = json.dumps(stripped, indent=2, default=str)
+    if len(text) > _MAX_CONTEXT_CHARS:
+        text = text[:_MAX_CONTEXT_CHARS] + "\n... (truncated)"
+    return text
+
+
+def _today_local():
+    """Today's date in the business time zone (BUSINESS_TZ, default Africa/Kampala)."""
+    from utils.clock import local_now
+    return local_now()
 
 
 # ─── Main entry point ─────────────────────────────────────────────────────────
@@ -263,7 +297,10 @@ async def _call_llm(
     business_context_section = _build_business_context_section(context)
     context_str = _build_context_str(context)
 
+    today = _today_local()
     user_prompt = _USER_PROMPT_TEMPLATE.format(
+        today=today.strftime("%Y-%m-%d"),
+        weekday=today.strftime("%A"),
         message=message,
         memory_section=memory_section,
         business_context_section=business_context_section,
@@ -273,19 +310,15 @@ async def _call_llm(
     raw, provider_used = await complete_with_fallback(
         prompt=user_prompt,
         system=system_prompt,
-        max_tokens=500,
+        max_tokens=1500,
+        json_mode=True,
     )
 
     if provider_used != "groq":
         logger.info("extraction_used_fallback_provider", extra={"provider": provider_used})
 
-    # Strip accidental markdown fences
-    if raw.startswith("```"):
-        parts = raw.split("```")
-        raw = parts[1] if len(parts) > 1 else raw
-        if raw.startswith("json"):
-            raw = raw[4:]
-    raw = raw.strip()
+    from services.llm.models import clean_completion
+    raw = clean_completion(raw)
 
     parsed = json.loads(raw)
 
@@ -327,9 +360,14 @@ def _apply_extraction(event: BusinessEvent, data: dict[str, Any]) -> None:
     except (TypeError, ValueError):
         event.confidence = 0.0
 
-    event.entities = data.get("entities", {})
+    event.entities = data.get("entities", {}) or {}
     event.reasoning = data.get("reasoning", "")
-    event.recommended_actions = data.get("recommended_actions", [])
+    # The model's action suggestions are kept for audit only. Which tools run
+    # is decided deterministically by event type in the ActionDispatcher —
+    # letting the model pick meant orders were rarely created and unknown
+    # keys (e.g. "record_expense") failed silently.
+    event.suggested_actions = [str(a) for a in data.get("recommended_actions", []) if a]
+    event.recommended_actions = []
     event.operational_effects = data.get("operational_effects", [])
 
     logger.info(

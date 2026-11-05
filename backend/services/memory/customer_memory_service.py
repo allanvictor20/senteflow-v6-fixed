@@ -64,6 +64,23 @@ class CustomerMemoryService:
         )
         return profile
 
+    def apply_customer_event(
+        self,
+        org_id: str,
+        customer_id: str,
+        display_name: str,
+        event_type: str,
+        entities: dict,
+    ) -> CustomerProfile:
+        """Update the CustomerProfile of the customer an event is about."""
+        profile = self._repo.get_or_create_by_id(org_id, customer_id, display_name)
+        if display_name and profile.display_name in ("Unknown", ""):
+            profile.display_name = display_name
+        profile.update_from_event(event_type, entities or {})
+        self._repo.upsert(org_id, profile)
+        logger.info("customer_profile_applied", extra={"customer_id": customer_id, "event_type": event_type})
+        return profile
+
     def get_context_for_ai(self, org_id: str, sender_id: str) -> str:
         profile = self._repo.get_by_phone(org_id, sender_id)
         if not profile:

@@ -10,7 +10,7 @@ import os
 import uuid
 import hashlib
 import hmac
-from datetime import datetime
+from datetime import datetime, timezone
 
 from typing import Optional
 
@@ -98,8 +98,15 @@ def normalize_evolution_event(payload: dict) -> Optional[MessageEvent]:
         if key.get("fromMe", False):
             return None
 
+        remote_jid = key.get("remoteJid", "unknown@s.whatsapp.net") or ""
+        # SenteFlow is a one-to-one assistant for the business owner. Group
+        # chats, status updates and broadcast lists are not addressed to it.
+        if remote_jid.endswith("@g.us") or remote_jid.endswith("@broadcast") or remote_jid.endswith("@newsletter"):
+            logger.debug("evolution_non_direct_chat_ignored", extra={"jid": remote_jid})
+            return None
+
         message_id = key.get("id") or str(uuid.uuid4())
-        sender_id = key.get("remoteJid", "unknown@s.whatsapp.net")
+        sender_id = remote_jid
         sender_name = data.get("pushName") or None
         chat_id = sender_id
 
@@ -112,9 +119,17 @@ def normalize_evolution_event(payload: dict) -> Optional[MessageEvent]:
             media_mime_type,
             media_filename,
         ) = _extract_message_content(message_type_raw, message_obj)
+        # Evolution configured with S3/MinIO puts a plain (decrypted) link here.
+        # Prefer it over WhatsApp's encrypted CDN url.
+        stored_media_url = message_obj.get("mediaUrl") or data.get("mediaUrl")
+        if media_url and stored_media_url:
+            media_url = stored_media_url
 
         ts_raw = data.get("messageTimestamp")
-        timestamp = datetime.utcfromtimestamp(int(ts_raw)) if ts_raw else utc_now()
+        timestamp = (
+            datetime.fromtimestamp(int(ts_raw), timezone.utc).replace(tzinfo=None)
+            if ts_raw else utc_now()
+        )
 
         event = MessageEvent(
             event_id=str(uuid.uuid4()),

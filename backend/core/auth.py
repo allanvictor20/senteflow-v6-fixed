@@ -31,8 +31,10 @@ async def verify_firebase_token(authorization: str = Header(default=None)) -> di
         raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
     token = authorization.split(" ", 1)[1]
     try:
+        import asyncio
         import firebase_admin.auth as fb_auth
-        return fb_auth.verify_id_token(token)
+        # verify_id_token may fetch Google's public keys over the network.
+        return await asyncio.to_thread(fb_auth.verify_id_token, token)
     except Exception as exc:
         logger.warning("token_verification_failed", extra={"error": str(exc)})
         raise HTTPException(status_code=401, detail="Invalid or expired token")
@@ -73,6 +75,22 @@ def ensure_org_access(token: dict, org_id: str) -> dict:
     return token
 
 
+async def require_org(token: dict, org_id: str) -> dict:
+    """
+    Async form of ensure_org_access for use inside `async def` routes.
+    The membership check is a blocking Firestore read, so it runs in a worker
+    thread instead of stalling the event loop.
+    """
+    import asyncio
+    return await asyncio.to_thread(ensure_org_access, token, org_id)
+
+
+def token_identity(token: dict) -> str:
+    """Who to record as the actor for audit fields — never taken from the request body."""
+    token = token or {}
+    return token.get("email") or token.get("uid") or "unknown"
+
+
 async def verify_org_access(org_id: str, token: dict = Depends(verify_firebase_token)) -> dict:
     """FastAPI dependency form — use with `Depends(verify_org_access)`."""
-    return ensure_org_access(token, org_id)
+    return await require_org(token, org_id)

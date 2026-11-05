@@ -1,36 +1,32 @@
 """
-SenteFlow AI — v5 Entry Point
-================================
-WhatsApp-native AI business memory assistant for SMEs.
-
-Changes from v4 (IDEA 07 — Proactive Agents, P3):
-  reminder_loop() and daily_briefing_loop() are now started on app startup.
-  The intelligence functions existed in v4 but were commented out ("Option C").
-  Now wired in — owner gets morning briefings and overdue reminders without
-  having to message in first.
+SenteFlow AI — Entry Point
+===========================
+WhatsApp-native AI business assistant for SMEs.
 
 Architecture:
   WhatsApp → Evolution API → /api/webhooks/whatsapp
-    → normalize (webhook_handler)
-    → route (message_router)
-    → ProcessMessageWorkflow
-        → ContextEngine (memory enrichment — parallel fetch, IDEA 10)
-        → EventExtractor (multi-provider LLM, IDEA 06+08)
-        → UpdateMemoryWorkflow (learn from event)
-        → GenerateReplyWorkflow (craft reply)
-    → WhatsApp reply
+    → normalize (webhook_handler) → queue (Firestore)
+    → which business owns this number? (services/tenancy.py)
+    → that business's MessageRouter
+        → ContextEngine → EventExtractor (multi-provider LLM)
+        → customer resolution → ActionDispatcher → reply
 
-  Background tasks (IDEA 07):
-    → reminder_loop        (every 1h — surfaces overdue payment promises)
-    → daily_briefing_loop  (every 24h — morning summary to owner)
+  Background tasks (started on app startup):
+    → reminder_loop        (hourly — due payment promises / follow-ups, every business)
+    → daily_briefing_loop  (each business once a day after BRIEFING_HOUR local time)
+    → webhook recovery     (every 5 min — re-runs messages a restart interrupted)
 """
 
 import asyncio
-
 import logging
 import os
 
 from dotenv import load_dotenv
+
+# Load .env BEFORE reading any configuration. Sentry used to be initialised
+# above this line, so SENTRY_DSN from .env was never seen.
+load_dotenv()
+
 import sentry_sdk
 
 _sentry_dsn = os.environ.get("SENTRY_DSN")
@@ -43,9 +39,8 @@ from firebase_admin import credentials, firestore
 from bootstrap.app_factory import create_app
 from bootstrap.dependency_injection import build_dependencies
 from core.errors import StructuredLogger
-from utils.clock import utc_now
 
-load_dotenv()
+APP_VERSION = "7.0.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,6 +56,8 @@ org_id = os.environ.get("DEFAULT_ORG_ID", "default")
 db = None
 deps = None
 
+WEBHOOK_RECOVERY_INTERVAL_S = 5 * 60
+
 
 # ── Firebase ──────────────────────────────────────────────────────────────────
 
@@ -68,9 +65,8 @@ def init_firebase():
     """
     Initialise the Firebase Admin SDK and return a Firestore client.
 
-    Deliberately a function, not module-level code: importing this module used
-    to open a Firestore connection as a side effect, which made `main` (and so
-    the helpers defined in it) unimportable without live cloud credentials.
+    A function, not module-level code, so importing `main` (as tests do) does
+    not need live cloud credentials.
     """
     if not firebase_admin._apps:
         cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
@@ -88,12 +84,12 @@ def build():
     db = init_firebase()
     deps = build_dependencies(db=db, org_id=org_id)
     app = create_app(deps=deps)
-    _register_startup_hooks(app)
-    logger.info("senteflow_started", org_id=org_id, version="6.0.0")
+    _register_lifecycle(app)
+    logger.info("senteflow_started", org_id=org_id, version=APP_VERSION)
     return app
 
 
-# ── IDEA 07: Proactive background agents ─────────────────────────────────────
+# ── Background agents ─────────────────────────────────────────────────────────
 
 # Long-lived loops need a strong reference, or the event loop may collect them.
 _agent_tasks: set[asyncio.Task] = set()
@@ -106,141 +102,64 @@ def _spawn_agent(coro, name: str) -> None:
     logger.info(f"{name}_started")
 
 
-def _register_startup_hooks(fastapi_app) -> None:
-    @fastapi_app.on_event("startup")
-    async def start_proactive_agents():
-        """
-        IDEA 07: Wire up proactive loops that were built but never started.
-        - reminder_loop: checks for overdue payment promises every hour
-        - daily_briefing_loop: sends owner a morning summary every 24h
-
-        Requires wa_client to be configured (EVOLUTION_API_URL + EVOLUTION_API_TOKEN).
-        Gracefully skips if WhatsApp is not configured (dev/test environments).
-        """
-        if deps is None or deps.wa_client is None:
-            logger.info("proactive_agents_skipped", reason="no WhatsApp client configured")
-            return
-
-        from tasks.reminder_sender import reminder_loop
-        _spawn_agent(
-            reminder_loop(wa_client=deps.wa_client, repo=deps.repo, org_id=org_id),
-            name="reminder_loop",
-        )
-        _spawn_agent(
-            _daily_briefing_loop(wa_client=deps.wa_client, repo=deps.repo, org_id=org_id),
-            name="daily_briefing_loop",
-        )
+async def _webhook_recovery_loop(interval_s: int = WEBHOOK_RECOVERY_INTERVAL_S) -> None:
+    from api.routes.whatsapp import requeue_and_process_stale
+    while True:
+        try:
+            await requeue_and_process_stale()
+        except Exception as exc:
+            logger.error("webhook_recovery_error", error=str(exc))
+        await asyncio.sleep(interval_s)
 
 
-async def _daily_briefing_loop(wa_client, repo, org_id: str, interval_hours: int = 24) -> None:
-    """
-    IDEA 07: Send the owner a proactive morning briefing once per day.
+async def start_background_agents(app_deps) -> None:
+    """Start the proactive loops. Skips WhatsApp-dependent ones if Evolution isn't configured."""
+    _spawn_agent(_webhook_recovery_loop(), name="webhook_recovery_loop")
 
-    Calls operational_intelligence functions and synthesises a summary:
-    - Overdue debts
-    - Low stock alerts
-    - Lost customers (not seen in 45 days)
-    - Revenue trend
+    if app_deps is None or app_deps.wa_client is None:
+        logger.info("proactive_agents_skipped", reason="no WhatsApp client configured")
+        return
 
-    Owner phone number is read from DEFAULT_OWNER_PHONE env var or the
-    BusinessProfile. Skips silently if not configured.
+    from tasks.reminder_sender import reminder_loop
+    from tasks.briefing import daily_briefing_loop
 
-    Design: run immediately on first loop iteration so the owner receives a
-    briefing shortly after deploy, then sleep for interval_hours between
-    subsequent runs.
-    """
-    import os
-    from services.memory.operational_intelligence import (
-        detect_overdue_debts,
-        detect_lost_customers,
-        detect_inventory_risk,
-        detect_revenue_trends,
+    _spawn_agent(
+        reminder_loop(
+            wa_client=app_deps.wa_client,
+            repo=app_deps.repo,
+            org_id=app_deps.org_id,
+            tenants=app_deps.tenants,
+        ),
+        name="reminder_loop",
+    )
+    _spawn_agent(
+        daily_briefing_loop(app_deps.wa_client, app_deps.repo, app_deps.tenants),
+        name="daily_briefing_loop",
     )
 
-    poll_seconds = interval_hours * 3600
-    owner_phone = os.environ.get("DEFAULT_OWNER_PHONE")
 
-    logger.info("daily_briefing_loop_running", interval_h=interval_hours)
+async def stop_background_agents() -> None:
+    for task in list(_agent_tasks):
+        task.cancel()
+    if _agent_tasks:
+        await asyncio.gather(*_agent_tasks, return_exceptions=True)
 
-    while True:
-        # Run briefing first, then sleep — so the first briefing fires on startup
-        # rather than after a full 24-hour wait.
-        if not owner_phone:
-            logger.warning("daily_briefing_skipped — DEFAULT_OWNER_PHONE not set")
-        else:
+
+def _register_lifecycle(fastapi_app) -> None:
+    from contextlib import asynccontextmanager
+
+    previous = fastapi_app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan(app_):
+        async with previous(app_):
+            await start_background_agents(deps)
             try:
-                lines: list[str] = []
+                yield
+            finally:
+                await stop_background_agents()
 
-                # Fetch raw data from Firestore, then pass to the pure functions
-                # in operational_intelligence.  Those functions accept list[dict],
-                # not (repo, org_id) — fetch once here and reuse.
-                try:
-                    raw_events = repo.list_transactions(org_id, limit=500) or []
-                except Exception as exc:
-                    logger.warning("briefing_fetch_events_failed", error=str(exc))
-                    raw_events = []
-
-                try:
-                    raw_customers = repo.list_customers(org_id, limit=500) if hasattr(repo, "list_customers") else []
-                except Exception as exc:
-                    logger.warning("briefing_fetch_customers_failed", error=str(exc))
-                    raw_customers = []
-
-                # Overdue payment promises
-                try:
-                    overdue = detect_overdue_debts(raw_events)
-                    if overdue:
-                        lines.append(f"💰 *Overdue payments*: {len(overdue)} customer(s) past due date")
-                        for d in overdue[:3]:
-                            name = d.get("debtor") or d.get("customer") or "Unknown"
-                            amt = d.get("amount")
-                            amt_str = f" — UGX {float(amt):,.0f}" if amt else ""
-                            lines.append(f"  • {name}{amt_str}")
-                except Exception as exc:
-                    logger.warning("briefing_overdue_debts_failed", error=str(exc))
-
-                # Inventory risks (uses event list)
-                try:
-                    inv_risks = detect_inventory_risk(raw_events)
-                    if inv_risks:
-                        lines.append(f"📦 *Stock alerts*: {len(inv_risks)} item(s) at risk")
-                except Exception as exc:
-                    logger.warning("briefing_inventory_failed", error=str(exc))
-
-                # Lost customers (uses customer list, not event list)
-                try:
-                    lost = detect_lost_customers(raw_customers)
-                    if lost:
-                        lines.append(f"👤 *Lost customers*: {len(lost)} not seen in 45+ days")
-                except Exception as exc:
-                    logger.warning("briefing_lost_customers_failed", error=str(exc))
-
-                # Revenue trend — key is "trend", not "direction"
-                try:
-                    trend = detect_revenue_trends(raw_events)
-                    if trend:
-                        direction = trend.get("trend", "")  # field is "trend", not "direction"
-                        if direction and direction != "stable":
-                            emoji = "📈" if direction == "up" else "📉"
-                            change_pct = trend.get("change_percent", 0)
-                            summary = f"{abs(change_pct):.1f}% vs last week"
-                            lines.append(f"{emoji} *Revenue*: {summary}")
-                except Exception as exc:
-                    logger.warning("briefing_revenue_failed", error=str(exc))
-
-                if lines:
-                    from datetime import datetime
-                    greeting = f"Good morning! Here's your SenteFlow briefing for {utc_now().strftime('%a %d %b')}:\n\n"
-                    message = greeting + "\n".join(lines)
-                    await wa_client.send_text(owner_phone, message)
-                    logger.info("daily_briefing_sent", lines=len(lines))
-                else:
-                    logger.info("daily_briefing_nothing_to_report")
-
-            except Exception as exc:
-                logger.error("daily_briefing_loop_error", error=str(exc))
-
-        await asyncio.sleep(poll_seconds)
+    fastapi_app.router.lifespan_context = lifespan
 
 
 def __getattr__(name: str):
@@ -248,9 +167,8 @@ def __getattr__(name: str):
     Build the app on first access to `main.app`.
 
     `uvicorn main:app` imports this module and then reads the `app` attribute,
-    so the ASGI entry point still works — but merely importing `main` (as the
-    tests do, to reach `_daily_briefing_loop`) no longer requires live Firebase
-    credentials.
+    so the ASGI entry point still works — but merely importing `main` no
+    longer requires live Firebase credentials.
     """
     if name == "app":
         return build()

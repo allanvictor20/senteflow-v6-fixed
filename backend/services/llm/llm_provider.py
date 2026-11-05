@@ -4,13 +4,13 @@ SenteFlow — Multi-Provider LLM Abstraction (IDEA 06, Groq edition)
 Prevents SenteFlow from going offline when the primary LLM provider is
 unavailable or rate-limited.
 
-Provider chain: Groq → Claude Haiku → OpenAI gpt-4o-mini
-Each provider implements LLMProvider.complete(). On quota/rate errors,
-the next provider is tried silently. Owner sees no disruption.
+Provider chain: Groq → Claude → OpenAI (fallbacks only when their keys are set)
+Each provider implements LLMProvider.complete(). On any error the next
+provider is tried. Owner sees no disruption.
 
 Groq is OpenAI-compatible, so the GroqProvider uses the `openai` SDK
-pointed at https://api.groq.com/openai/v1. Default model:
-`llama-3.3-70b-versatile`. Override with the GROQ_MODEL env var.
+pointed at https://api.groq.com/openai/v1. Model selection lives in
+services/llm/models.py (default: openai/gpt-oss-120b; override GROQ_MODEL).
 
 Usage:
     from services.llm.llm_provider import complete_with_fallback
@@ -24,16 +24,18 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Default Groq model. Override with the GROQ_MODEL env var.
-DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
-GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+from services.llm import models as llm_models
+
+# Kept for backward compatibility; the live value comes from llm_models.text_model().
+DEFAULT_GROQ_MODEL = llm_models.DEFAULT_TEXT_MODEL
+GROQ_BASE_URL = llm_models.GROQ_BASE_URL
 
 
 class LLMProvider(ABC):
     name: str = "base"
 
     @abstractmethod
-    async def complete(self, prompt: str, system: str, max_tokens: int = 500) -> str:
+    async def complete(self, prompt: str, system: str, max_tokens: int = 500, json_mode: bool = False) -> str:
         """Send prompt + system to the LLM, return raw text response."""
 
     def _is_quota_error(self, exc: Exception) -> bool:
@@ -44,20 +46,26 @@ class LLMProvider(ABC):
 class GroqProvider(LLMProvider):
     """
     Primary provider. Uses Groq's OpenAI-compatible endpoint via the `openai`
-    SDK (already in requirements). Default model: llama-3.3-70b-versatile.
+    SDK (already in requirements). Model: services/llm/models.text_model().
     """
 
     name = "groq"
 
-    async def complete(self, prompt: str, system: str, max_tokens: int = 500) -> str:
+    async def complete(self, prompt: str, system: str, max_tokens: int = 500, json_mode: bool = False) -> str:
         from openai import AsyncOpenAI
 
         api_key = os.environ.get("GROQ_API_KEY")
         if not api_key:
             raise ValueError("GROQ_API_KEY not set")
 
-        model = os.environ.get("GROQ_MODEL", DEFAULT_GROQ_MODEL)
-        client = AsyncOpenAI(api_key=api_key, base_url=GROQ_BASE_URL)
+        model = llm_models.text_model()
+        client = AsyncOpenAI(api_key=api_key, base_url=GROQ_BASE_URL, timeout=60)
+        kwargs: dict[str, Any] = {}
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        extra = llm_models.groq_extra_body(model)
+        if extra:
+            kwargs["extra_body"] = extra
         response = await client.chat.completions.create(
             model=model,
             max_tokens=max_tokens,
@@ -66,51 +74,56 @@ class GroqProvider(LLMProvider):
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
+            **kwargs,
         )
-        return (response.choices[0].message.content or "").strip()
+        return llm_models.clean_completion(response.choices[0].message.content)
 
 
 class ClaudeProvider(LLMProvider):
     name = "claude"
 
-    async def complete(self, prompt: str, system: str, max_tokens: int = 500) -> str:
+    async def complete(self, prompt: str, system: str, max_tokens: int = 500, json_mode: bool = False) -> str:
         import anthropic
 
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY not set")
 
-        client = anthropic.AsyncAnthropic(api_key=api_key)
+        client = anthropic.AsyncAnthropic(api_key=api_key, timeout=60)
         message = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=llm_models.anthropic_model(),
             max_tokens=max_tokens,
             system=system,
             messages=[{"role": "user", "content": prompt}],
         )
-        return message.content[0].text.strip()
+        return llm_models.clean_completion(message.content[0].text)
 
 
 class OpenAIProvider(LLMProvider):
     name = "openai"
 
-    async def complete(self, prompt: str, system: str, max_tokens: int = 500) -> str:
+    async def complete(self, prompt: str, system: str, max_tokens: int = 500, json_mode: bool = False) -> str:
         import openai
 
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OPENAI_API_KEY not set")
 
-        client = openai.AsyncOpenAI(api_key=api_key)
+        client = openai.AsyncOpenAI(api_key=api_key, timeout=60)
+        kwargs: dict[str, Any] = {}
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=llm_models.openai_model(),
             max_tokens=max_tokens,
             temperature=0.1,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
+            **kwargs,
         )
-        return response.choices[0].message.content.strip()
+        return llm_models.clean_completion(response.choices[0].message.content)
 
 
 class AllProvidersExhausted(Exception):
@@ -180,6 +193,7 @@ async def complete_with_fallback(
     system: str,
     max_tokens: int = 500,
     providers: list[LLMProvider] | None = None,
+    json_mode: bool = False,
 ) -> tuple[str, str]:
     """
     Try each provider in order. Return (response_text, provider_name).
@@ -199,7 +213,10 @@ async def complete_with_fallback(
 
     for provider in chain:
         try:
-            text = await provider.complete(prompt, system, max_tokens=max_tokens)
+            if json_mode:
+                text = await provider.complete(prompt, system, max_tokens=max_tokens, json_mode=True)
+            else:
+                text = await provider.complete(prompt, system, max_tokens=max_tokens)
             if provider.name != (chain[0].name if chain else "groq"):
                 logger.warning(
                     "llm_fallback_used",

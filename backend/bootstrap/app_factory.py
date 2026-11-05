@@ -26,7 +26,7 @@ def create_app(deps=None) -> FastAPI:
     app = FastAPI(
         title="SenteFlow AI",
         description="WhatsApp-native AI business memory assistant for SMEs",
-        version="5.0.0",
+        version="7.0.0",
     )
 
     # CORS: read from ALLOWED_ORIGINS env var (comma-separated).
@@ -51,6 +51,7 @@ def create_app(deps=None) -> FastAPI:
     from api.routes.insights import insights_router, set_insights_dependencies
     from api.routes.orders import orders_router, set_order_dependencies
     from api.routes.tasks import tasks_router, set_task_dependencies
+    from api.routes.org import org_router, set_org_dependencies
     from api.routes import (
         health_router,
         extract_router,
@@ -67,10 +68,8 @@ def create_app(deps=None) -> FastAPI:
         # Every router keeps its collaborators in module globals, so each one
         # needs an explicit hand-off here. Miss one and its endpoints return
         # "repository not initialised" for the lifetime of the process.
-        set_whatsapp_dependencies(
-            wa_client=deps.wa_client,
-            message_router=deps.message_router(),
-        )
+        set_whatsapp_dependencies(deps=deps)
+        set_org_dependencies(tenants=deps.tenants)
         set_repository(deps.repo)
         set_customer_dependencies(
             profile_repo=deps.customer_profile_repo,
@@ -104,5 +103,6 @@ def create_app(deps=None) -> FastAPI:
     app.include_router(insights_router)
     app.include_router(orders_router)
     app.include_router(tasks_router)
+    app.include_router(org_router)
 
     return app

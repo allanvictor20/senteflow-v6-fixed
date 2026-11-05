@@ -24,8 +24,18 @@ logger = logging.getLogger(__name__)
 
 
 async def update_from_event(event: dict, org_id: str, memory_repo, customer_repo) -> None:
-    """Update first-class CustomerMemory from a newly processed BusinessEvent."""
-    customer_id = event.get("related_customer_id") or event.get("sender_id")
+    """
+    Update first-class CustomerMemory from a newly processed BusinessEvent.
+
+    Keyed on the customer the event is ABOUT. The sender is the business
+    owner, so falling back to sender_id would file every customer's history
+    under the owner.
+    """
+    customer_id = (
+        event.get("customer_id")
+        or event.get("related_customer_id")
+        or (event.get("entities") or {}).get("customer_id")
+    )
     if not customer_id:
         return
 
@@ -39,12 +49,18 @@ async def update_from_event(event: dict, org_id: str, memory_repo, customer_repo
     updates = {
         "customer_id": customer_id,
         "org_id": org_id,
-        "display_name": customer.get("display_name") or existing.get("display_name") or "Unknown",
+        "display_name": (
+            customer.get("display_name")
+            or event.get("customer_name")
+            or existing.get("display_name")
+            or "Unknown"
+        ),
         "last_contact": utc_now().isoformat(),
     }
 
     if event_type in ("payment_received", "payment", "income"):
         updates["total_paid"] = existing.get("total_paid", 0) + amount
+        updates["total_outstanding"] = max(0.0, existing.get("total_outstanding", 0) - amount)
     elif event_type == "debt_created":
         updates["total_outstanding"] = existing.get("total_outstanding", 0) + amount
     elif event_type in ("customer_order", "order_received"):
@@ -113,12 +129,20 @@ class BusinessMemoryEngine:
 
     def _store_promise(self, business_event: Any) -> None:
         """Persist a payment promise so it can be checked later."""
+        from utils.dates import reminder_due_at
+
+        entities = business_event.entities or {}
+        due_at = reminder_due_at(entities.get("due_date"), after_due_date=False, hour=23)
         doc = {
             "type": "payment_promise",
             "event_id": business_event.event_id,
-            "entities": business_event.entities,
+            "entities": entities,
             "raw_message": business_event.raw_message,
             "sender_id": business_event.sender_id,
+            "customer_id": getattr(business_event, "customer_id", None),
+            "debtor": entities.get("customer") or entities.get("debtor"),
+            "amount": entities.get("amount"),
+            "due_at": due_at.isoformat() if due_at else None,
             "created_at": utc_now().isoformat(),
             "status": "pending",
             "org_id": self.org_id,
@@ -207,14 +231,22 @@ class BusinessMemoryEngine:
             return []
 
     def get_overdue_promises(self, days_threshold: int = 2) -> list[dict]:
-        """Return promises that are older than `days_threshold` days without resolution."""
+        """
+        Open promises that are past due: past their due date when one is
+        known, otherwise older than `days_threshold` days.
+        """
         all_promises = self.get_unresolved_promises()
-        threshold = utc_now() - timedelta(days=days_threshold)
+        now = utc_now()
+        threshold = now - timedelta(days=days_threshold)
         overdue = []
         for p in all_promises:
-            created = p.get("created_at", "")
             try:
-                created_dt = datetime.fromisoformat(created)
+                due_at = p.get("due_at")
+                if due_at:
+                    if datetime.fromisoformat(str(due_at)) < now:
+                        overdue.append(p)
+                    continue
+                created_dt = datetime.fromisoformat(str(p.get("created_at", "")))
                 if created_dt < threshold:
                     overdue.append(p)
             except (ValueError, TypeError):
@@ -285,7 +317,7 @@ class BusinessMemoryEngine:
         insights: list[dict] = []
         try:
             overdue = self.get_overdue_promises(days_threshold=2)
-            sender_overdue = [p for p in overdue if p.get("sender_id") == sender_id]
+            sender_overdue = [p for p in overdue if _belongs_to(p, sender_id)]
             for promise in sender_overdue[:2]:
                 entities = promise.get("entities") or {}
                 debtor = entities.get("debtor") or "this customer"
@@ -326,15 +358,16 @@ class BusinessMemoryEngine:
         """
         try:
             promises = self.get_unresolved_promises()
-            sender_promises = [p for p in promises if p.get("sender_id") == sender_id]
+            sender_promises = [p for p in promises if _belongs_to(p, sender_id)]
 
             # Count resolved vs pending to get a keep-rate approximation.
             # Unresolved list only contains pending ones; we use overdue count
             # as a proxy for broken promises.
             overdue_promises = self.get_overdue_promises(days_threshold=3)
-            sender_overdue = [p for p in overdue_promises if p.get("sender_id") == sender_id]
+            sender_overdue = [p for p in overdue_promises if _belongs_to(p, sender_id)]
 
-            total_sampled = len(sender_promises) + len(sender_overdue)
+            # Overdue promises are a subset of the open ones.
+            total_sampled = len(sender_promises)
             if total_sampled == 0:
                 return {"reliability": "unknown", "avg_days_to_pay": None, "promise_kept_rate": None}
 
@@ -356,3 +389,13 @@ class BusinessMemoryEngine:
         except Exception as exc:
             logger.debug("get_payment_patterns_failed", extra={"error": str(exc)})
             return {"reliability": "unknown", "avg_days_to_pay": None, "promise_kept_rate": None}
+
+
+def _belongs_to(promise: dict, customer_id: str) -> bool:
+    """Promise belongs to this customer (new records) or sender (records before v7)."""
+    entities = promise.get("entities") or {}
+    return customer_id in (
+        promise.get("customer_id"),
+        entities.get("customer_id"),
+        promise.get("sender_id"),
+    )

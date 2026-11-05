@@ -1,12 +1,21 @@
 rules_version = '2';
 
-// SenteFlow AI — Firestore Security Rules v5
+// SenteFlow AI — Firestore Security Rules v7
 // Each organization's data is isolated: authenticated members can only
-// read/write their own org's collections.
+// read/write their own org's collections. The backend uses the Admin SDK,
+// which bypasses these rules; they govern direct access from the dashboard.
+//
+// NOTE on `allow write`: in Firestore rules `write` = create + update + delete,
+// and access is granted if ANY matching rule allows it. So
+//     allow write: if isMember(orgId);
+//     allow delete: if false;
+// still lets members delete. Collections that must not be deletable therefore
+// grant `create, update` explicitly instead of `write`.
 //
 // Collections covered:
-//   transactions, events, customers, conversations, memory,
-//   orders, reminders, promises, alerts, audit_logs, profile
+//   transactions, events, customers, conversations (+ interactions),
+//   memory, orders, reminders, promises, alerts, audit_logs, profile,
+//   meta, phone_index (server-only), webhook_queue (server-only)
 
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -21,10 +30,17 @@ service cloud.firestore {
         exists(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid));
     }
 
+    // ── WhatsApp number → business index (server-only) ───────────────────────
+    // Managed through the backend's /api/org/phones endpoints.
+    match /phone_index/{phone} {
+      allow read, write: if false;
+    }
+
     // ── Organizations ─────────────────────────────────────────────────────────
     match /organizations/{orgId} {
       allow read: if isMember(orgId);
-      allow write: if isMember(orgId);
+      allow update: if isMember(orgId);
+      allow create, delete: if false;
 
       // ── Transactions (legacy) ─────────────────────────────────────────────
       match /transactions/{transactionId} {
@@ -59,48 +75,46 @@ service cloud.firestore {
       // ── Customers ─────────────────────────────────────────────────────────
       match /customers/{customerId} {
         allow read: if isMember(orgId);
-        allow write: if isMember(orgId);
+        allow create, update: if isMember(orgId);
         allow delete: if false;
       }
 
       // ── Conversations ─────────────────────────────────────────────────────
-      // NOTE: the backend stores the conversation timeline as an ARRAY FIELD on
-      // this document (via ArrayUnion), not as a subcollection. The append-only
-      // guarantee therefore has to be expressed here — a rule on a
-      // /timeline/{entryId} subcollection would never be evaluated, because no
-      // such subcollection is ever written.
+      // The conversation timeline is an array written only by the backend
+      // (Admin SDK). Clients may not touch it at all: a size check alone let
+      // a client rewrite every past entry, or drop the field entirely.
       match /conversations/{conversationId} {
         allow read: if isMember(orgId);
-        allow create: if isMember(orgId);
+        allow create: if isMember(orgId) && !('timeline' in request.resource.data);
         allow update: if isMember(orgId)
-          // Entries may only be appended: the new timeline must start with the
-          // existing one, so nothing already recorded can be edited or removed.
-          && (
-            !('timeline' in resource.data)
-            || !('timeline' in request.resource.data)
-            || request.resource.data.timeline.size() >= resource.data.timeline.size()
-          );
+          && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['timeline']);
         allow delete: if false;
+
+        // Owner ↔ SenteFlow message log: append-only from the backend.
+        match /interactions/{interactionId} {
+          allow read: if isMember(orgId);
+          allow write: if false;
+        }
       }
 
       // ── Conversation Aggregates (state machine snapshots) ─────────────────
       match /conversation_aggregates/{aggregateId} {
         allow read: if isMember(orgId);
-        allow write: if isMember(orgId);
+        allow create, update: if isMember(orgId);
         allow delete: if false;
       }
 
       // ── Customer Profiles (rich CustomerProfile model) ────────────────────
       match /customer_profiles/{profileId} {
         allow read: if isMember(orgId);
-        allow write: if isMember(orgId);
+        allow create, update: if isMember(orgId);
         allow delete: if false;
       }
 
       // ── Media Assets (receipts, voice notes) ──────────────────────────────
       match /media_assets/{assetId} {
         allow read: if isMember(orgId);
-        allow write: if isMember(orgId);
+        allow create, update: if isMember(orgId);
         allow delete: if false;
       }
 
@@ -114,7 +128,7 @@ service cloud.firestore {
       // ── Tasks ─────────────────────────────────────────────────────────────
       match /tasks/{taskId} {
         allow read: if isMember(orgId);
-        allow write: if isMember(orgId);
+        allow create, update: if isMember(orgId);
         allow delete: if false;
       }
 
@@ -128,7 +142,7 @@ service cloud.firestore {
       // ── Customer Memory ───────────────────────────────────────────────────
       match /memory/{customerId} {
         allow read: if isMember(orgId);
-        allow write: if isMember(orgId);
+        allow create, update: if isMember(orgId);
         allow delete: if false;
       }
 
@@ -176,7 +190,14 @@ service cloud.firestore {
       // ── Business Profile ──────────────────────────────────────────────────
       match /profile/{docId} {
         allow read: if isMember(orgId);
-        allow write: if isMember(orgId);
+        allow create, update: if isMember(orgId);
+        allow delete: if false;
+      }
+
+      // ── Server bookkeeping (e.g. daily briefing markers) ──────────────────
+      match /meta/{docId} {
+        allow read: if isMember(orgId);
+        allow write: if false;
       }
 
       // ── Audit Logs (immutable) ────────────────────────────────────────────

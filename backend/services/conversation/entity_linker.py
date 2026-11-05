@@ -19,29 +19,31 @@ class EntityLinker:
         self.org_id = org_id
 
     def link_business_event(self, event: Any) -> list[dict[str, Any]]:
-        conversation = self.repo.get_conversation(self.org_id, event.sender_id) or {}
+        customer_id = getattr(event, "customer_id", None)
+        conv_key = customer_id or event.sender_id
+        conversation = self.repo.get_conversation(self.org_id, conv_key) or {}
         if inspect.isawaitable(conversation):
             conversation = {}
-        links: list[EntityLink] = [
-            self._link(
+        links: list[EntityLink] = []
+        if customer_id:
+            links.append(self._link(
                 "business_event",
                 event.event_id,
                 "customer",
-                event.sender_id,
-                "sent_by",
-                0.98,
-                ["same WhatsApp sender"],
-            ),
-            self._link(
+                customer_id,
+                "about",
+                0.9,
+                ["customer named in the owner's message"],
+            ))
+            links.append(self._link(
                 "business_event",
                 event.event_id,
                 "conversation",
-                event.sender_id,
+                customer_id,
                 "belongs_to",
-                0.96,
-                ["same sender conversation"],
-            ),
-        ]
+                0.9,
+                ["same customer"],
+            ))
 
         order_id = event.entities.get("order_id") or conversation.get("active_order_id")
         if order_id:

@@ -18,7 +18,7 @@ def media_source_hint(event: MessageEvent) -> str:
 
 async def save_whatsapp_media(event: MessageEvent, wa_client) -> Optional[str]:
     """Download a WhatsApp media attachment and return a local storage path."""
-    if not event.media_url:
+    if not event.media_url and not event.message_id:
         return None
     return await download_and_save_media(
         media_url=event.media_url,
@@ -26,4 +26,6 @@ async def save_whatsapp_media(event: MessageEvent, wa_client) -> Optional[str]:
         sender_id=event.sender_id,
         source_hint=media_source_hint(event),
         wa_client=wa_client,
+        message_id=event.message_id,
+        remote_jid=event.chat_id,
     )
