@@ -6,7 +6,7 @@
  */
 
 import { C, s } from "../../utils/theme";
-import { isExpenseType, confidenceColor } from "../../utils/format";
+import { moneyDirection, signedAmount, confidenceColor } from "../../utils/format";
 import { getTransactionEvidence } from "../../services/api";
 import { useState } from "react";
 
@@ -117,7 +117,9 @@ export function EvidenceModal({ evidence, onClose }) {
 
 export function TxnRow({ t, orgId }) {
   const [evidence, setEvidence] = useState(null);
-  const expenseType = isExpenseType(t.transaction_type || t.type);
+  const direction = moneyDirection(t.transaction_type || t.type || t.event_type);
+  const expenseType = direction === "out";
+  const amountTint = direction === "in" ? C.green : direction === "out" ? C.red : direction === "owed" ? C.yellow : C.textMuted;
   const confColor = confidenceColor(t.confidence_overall, C);
 
   async function viewEvidence() {
@@ -191,9 +193,8 @@ export function TxnRow({ t, orgId }) {
           </div>
         </div>
         <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
-          <span style={{ color: expenseType ? C.red : C.green, fontWeight: 700 }}>
-            {expenseType ? "-" : "+"}
-            {t.currency} {Number(t.amount).toLocaleString()}
+          <span style={{ color: amountTint, fontWeight: 700 }}>
+            {signedAmount(t)}
           </span>
           <button
             style={{ background: "none", border: "none", color: C.textMuted, cursor: "pointer", fontSize: 11, padding: 0 }}

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { C, s } from "../../utils/theme";
-import { fmt } from "../../utils/format";
+import { moneyDirection, signedAmount } from "../../utils/format";
 
 function eventTypeOf(item) {
   return item.event_type || item.transaction_type || item.type || "business_note";
@@ -8,6 +8,12 @@ function eventTypeOf(item) {
 
 function eventLabel(type) {
   return String(type).replaceAll("_", " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function amountColor(type, amount) {
+  if (!amount) return C.textMuted;
+  const dir = moneyDirection(type);
+  return dir === "in" ? C.green : dir === "out" ? C.red : dir === "owed" ? C.yellow : C.textDim;
 }
 
 function eventAmount(item) {
@@ -24,6 +30,7 @@ export default function ActivityFeedView({ transactions = [] }) {
     { key: "customer_order", label: "Orders" },
     { key: "payment_promise", label: "Promises" },
     { key: "expense_recorded", label: "Expenses" },
+    { key: "debt_created", label: "Debts" },
     { key: "low_stock_alert", label: "Stock" },
   ];
 
@@ -102,8 +109,8 @@ export default function ActivityFeedView({ transactions = [] }) {
                 </div>
                 {time && <div style={{ color: C.textMuted, fontSize: 11, marginTop: 3 }}>{String(time).slice(0, 16)}</div>}
               </div>
-              <div style={{ color: amount ? C.green : C.textMuted, fontWeight: 800, fontSize: 13 }}>
-                {amount ? fmt(amount) : ""}
+              <div style={{ color: amountColor(type, amount), fontWeight: 800, fontSize: 13, whiteSpace: "nowrap" }}>
+                {amount ? signedAmount({ ...item, amount, transaction_type: item.transaction_type || type }) : ""}
               </div>
             </div>
           );
